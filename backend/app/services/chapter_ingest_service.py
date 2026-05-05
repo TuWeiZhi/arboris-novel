@@ -44,8 +44,14 @@ class ChapterIngestionService:
         content: str,
         summary: Optional[str],
         user_id: int,
+        purge_summary: bool = False,
     ) -> None:
-        """将章节正文与摘要写入向量库，供后续 RAG 检索使用。"""
+        """将章节正文与摘要写入向量库，供后续 RAG 检索使用。
+
+        Args:
+            summary: 新摘要文本；为 None 或空表示"跳过摘要更新"，不会删除已有摘要。
+            purge_summary: 显式要求清空该章节摘要向量（如章节被回滚），仅在确实需要时使用。
+        """
         if not settings.vector_store_enabled:
             logger.warning("向量库未启用，跳过章节向量写入: project=%s chapter=%s", project_id, chapter_number)
             return
@@ -64,7 +70,6 @@ class ChapterIngestionService:
             chapter_number,
             len(chunks),
         )
-        await self._vector_store.delete_by_chapters(project_id, [chapter_number])
 
         chunk_records = []
         for index, chunk_text in enumerate(chunks):
@@ -99,6 +104,12 @@ class ChapterIngestionService:
 
         if chunk_records:
             await self._vector_store.upsert_chunks(records=chunk_records)
+            # 清理旧片段（upsert-then-prune，避免先删后写导致数据丢失）
+            await self._vector_store.delete_chunks_except(
+                project_id=project_id,
+                chapter_number=chapter_number,
+                keep_ids=[record["id"] for record in chunk_records],
+            )
             logger.info(
                 "章节正文向量写入完成: project=%s chapter=%s 成功片段=%d",
                 project_id,
@@ -127,6 +138,11 @@ class ChapterIngestionService:
                             }
                         ]
                     )
+                    await self._vector_store.delete_summaries_except(
+                        project_id=project_id,
+                        chapter_number=chapter_number,
+                        keep_ids=[summary_id],
+                    )
                     logger.info(
                         "章节摘要向量写入完成: project=%s chapter=%s",
                         project_id,
@@ -138,6 +154,19 @@ class ChapterIngestionService:
                         project_id,
                         chapter_number,
                     )
+        elif purge_summary:
+            # 显式要求清空该章节的所有摘要向量
+            await self._vector_store.delete_summaries_except(
+                project_id=project_id,
+                chapter_number=chapter_number,
+                keep_ids=[],
+            )
+            logger.info(
+                "已按 purge_summary 清空章节摘要向量: project=%s chapter=%s",
+                project_id,
+                chapter_number,
+            )
+        # summary 为 None/空 且未要求 purge → 静默跳过摘要部分，保留已有数据
 
     async def delete_chapters(self, project_id: str, chapter_numbers: Sequence[int]) -> None:
         """从向量库中删除指定章节的所有片段与摘要。"""

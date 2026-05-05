@@ -16,6 +16,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from ..models.project_memory import ProjectMemory, ChapterSnapshot
 from ..models.memory_layer import CharacterState
@@ -23,6 +24,11 @@ from ..models.novel import Chapter, ChapterVersion, NovelProject
 from ..models.chapter_blueprint import ChapterBlueprint
 from .llm_service import LLMService
 from .vector_store_service import VectorStoreService
+from ..utils.character_state import get_project_raw_state_text
+from ..utils.json_utils import unwrap_markdown_json
+
+# 关键步骤失败将阻止 last_updated_chapter 推进；可选步骤失败仅记录。
+_CRITICAL_STEPS = {"global_summary", "character_state", "plot_arcs"}
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +187,8 @@ class FinalizeService:
             "chapter_number": chapter_number,
             "updates": {}
         }
-        
+        failed_steps: List[str] = []
+
         try:
             # 1. 获取或创建项目记忆
             project_memory = await self._get_or_create_project_memory(project_id)
@@ -195,7 +202,9 @@ class FinalizeService:
             if new_summary:
                 project_memory.global_summary = new_summary
                 result["updates"]["global_summary"] = "updated"
-            
+            else:
+                failed_steps.append("global_summary")
+
             # 3. 更新角色状态
             old_state = await self._get_character_state_text(project_id)
             new_state = await self._update_character_state(
@@ -206,7 +215,9 @@ class FinalizeService:
             if new_state:
                 await self._save_character_state(project_id, chapter_number, new_state)
                 result["updates"]["character_state"] = "updated"
-            
+            else:
+                failed_steps.append("character_state")
+
             # 4. 更新剧情线追踪
             new_plot_arcs = await self._update_plot_arcs(
                 chapter_text=chapter_text,
@@ -214,45 +225,63 @@ class FinalizeService:
                 old_plot_arcs=project_memory.plot_arcs or {},
                 user_id=user_id
             )
-            if new_plot_arcs:
+            if new_plot_arcs is not None:
                 project_memory.plot_arcs = new_plot_arcs
                 result["updates"]["plot_arcs"] = "updated"
-            
+            else:
+                failed_steps.append("plot_arcs")
+
             # 5. 更新向量库
             if not skip_vector_update and self.vector_store_service:
-                await self._update_vector_store(
+                vector_ok = await self._update_vector_store(
                     project_id=project_id,
                     chapter_number=chapter_number,
                     chapter_text=chapter_text
                 )
-                result["updates"]["vector_store"] = "updated"
-            
+                if vector_ok:
+                    result["updates"]["vector_store"] = "updated"
+                else:
+                    failed_steps.append("vector_store")
+
             # 6. 创建章节快照
             chapter_summary = await self._generate_chapter_summary(
                 chapter_text=chapter_text,
                 chapter_number=chapter_number,
                 user_id=user_id
             )
+            if not chapter_summary:
+                failed_steps.append("chapter_summary")
             await self._create_chapter_snapshot(
                 project_id=project_id,
                 chapter_number=chapter_number,
                 global_summary=new_summary or project_memory.global_summary,
-                character_states=new_state,
-                plot_arcs=new_plot_arcs or project_memory.plot_arcs,
+                character_states=new_state or old_state,
+                plot_arcs=new_plot_arcs if new_plot_arcs is not None else project_memory.plot_arcs,
                 chapter_summary=chapter_summary,
                 word_count=len(chapter_text)
             )
             result["updates"]["snapshot"] = "created"
             
-            # 7. 更新项目记忆的最后更新章节
-            project_memory.last_updated_chapter = chapter_number
-            project_memory.version += 1
-            
+            # 7. 仅当所有关键步骤成功时推进 last_updated_chapter，避免下一章基于错误 baseline
+            critical_failed = [s for s in failed_steps if s in _CRITICAL_STEPS]
+            if not critical_failed:
+                project_memory.last_updated_chapter = chapter_number
+                project_memory.version += 1
+            else:
+                logger.warning(
+                    "关键步骤失败，跳过 last_updated_chapter 推进: project=%s chapter=%s critical=%s",
+                    project_id, chapter_number, critical_failed,
+                )
+
             # 8. 更新章节蓝图状态
             await self._update_blueprint_status(project_id, chapter_number)
-            
+
             self.db.commit()
-            logger.info(f"定稿处理完成: project={project_id}, chapter={chapter_number}")
+            if failed_steps:
+                result["success"] = False
+                result["failed_steps"] = failed_steps
+                result["critical_failed"] = critical_failed
+            logger.info(f"定稿处理完成: project={project_id}, chapter={chapter_number}, failed_steps={failed_steps}")
             
         except Exception as e:
             logger.error(f"定稿处理失败: {e}")
@@ -308,21 +337,27 @@ class FinalizeService:
             return None
     
     async def _get_character_state_text(self, project_id: str) -> str:
-        """获取角色状态文本"""
-        # 获取最新的角色状态记录
+        """获取角色状态文本，优先从 ProjectMemory.extra 读取，兼容历史 CharacterState 数据。"""
+        text = get_project_raw_state_text(self.db, project_id)
+        if text:
+            return text
+
+        # 历史散点 CharacterState 仍可降级渲染
         states = self.db.query(CharacterState).filter(
             CharacterState.project_id == project_id
         ).order_by(CharacterState.chapter_number.desc()).all()
-        
+
         if not states:
             return ""
-        
-        # 按角色分组，取每个角色的最新状态
+
+        # 按角色分组，取每个角色的最新状态（跳过 __all__ 聚合记录）
         latest_states = {}
         for state in states:
+            if state.character_name == "__all__":
+                continue
             if state.character_name not in latest_states:
                 latest_states[state.character_name] = state
-        
+
         # 格式化为文本
         text_parts = []
         for name, state in latest_states.items():
@@ -339,7 +374,7 @@ class FinalizeService:
             if state.new_knowledge:
                 parts.append(f"├──触发事件: {state.new_knowledge}")
             text_parts.append("\n".join(parts))
-        
+
         return "\n\n".join(text_parts)
     
     async def _update_character_state(
@@ -372,18 +407,24 @@ class FinalizeService:
         chapter_number: int,
         state_text: str
     ):
-        """保存角色状态到数据库"""
-        # 解析状态文本并保存
-        # 这里简化处理，实际可以做更精细的解析
-        # 创建一个通用的状态记录
-        state = CharacterState(
-            project_id=project_id,
-            character_id=0,  # 通用记录
-            character_name="__all__",
-            chapter_number=chapter_number,
-            extra={"raw_state_text": state_text}
-        )
-        self.db.add(state)
+        """保存角色状态到 ProjectMemory.extra，避免 character_id FK 违规。
+
+        单调性保护：仅当 chapter_number 不小于已记录章节时才覆盖，避免重定稿旧章
+        把最新状态退回。`flag_modified` 确保 SQLAlchemy 检测到 JSON 内容变更。
+        """
+        memory = await self._get_or_create_project_memory(project_id)
+        extra = dict(memory.extra or {})
+        last_chapter = extra.get("raw_state_chapter")
+        if isinstance(last_chapter, int) and chapter_number < last_chapter:
+            logger.info(
+                "跳过角色状态写入：chapter=%s 早于已记录 chapter=%s",
+                chapter_number, last_chapter,
+            )
+            return
+        extra["raw_state_text"] = state_text
+        extra["raw_state_chapter"] = chapter_number
+        memory.extra = extra
+        flag_modified(memory, "extra")
     
     async def _update_plot_arcs(
         self,
@@ -409,13 +450,8 @@ class FinalizeService:
                 temperature=0.3
             )
             if response:
-                # 尝试解析JSON
-                response = response.strip()
-                if response.startswith("```"):
-                    response = response.split("```")[1]
-                    if response.startswith("json"):
-                        response = response[4:]
-                return json.loads(response)
+                normalized = unwrap_markdown_json(response)
+                return json.loads(normalized)
         except json.JSONDecodeError as e:
             logger.error(f"解析剧情线JSON失败: {e}")
         except Exception as e:
@@ -428,20 +464,21 @@ class FinalizeService:
         project_id: str,
         chapter_number: int,
         chapter_text: str
-    ):
-        """更新向量库"""
+    ) -> bool:
+        """更新向量库，返回是否成功。"""
         if not self.vector_store_service:
-            return
-        
+            return False
+
         try:
-            # 将章节文本分块并存入向量库
             await self.vector_store_service.add_chapter_to_store(
                 project_id=project_id,
                 chapter_number=chapter_number,
                 content=chapter_text
             )
+            return True
         except Exception as e:
             logger.error(f"更新向量库失败: {e}")
+            return False
     
     async def _generate_chapter_summary(
         self,

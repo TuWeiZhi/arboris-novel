@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .llm_service import LLMService
 from .prompt_service import PromptService
+from ..utils.json_utils import unwrap_markdown_json
 
 logger = logging.getLogger(__name__)
 
@@ -178,13 +179,10 @@ class SelfCritiqueService:
                 timeout=120.0
             )
             
-            content = response
-            json_start = content.find("{")
-            json_end = content.rfind("}") + 1
-            if json_start >= 0 and json_end > json_start:
-                result = json.loads(content[json_start:json_end])
-                result["weight"] = dim_config["severity_weight"]
-                return result
+            normalized = unwrap_markdown_json(response)
+            result = json.loads(normalized)
+            result["weight"] = dim_config["severity_weight"]
+            return result
         except Exception as e:
             logger.warning(f"批评维度 {dimension.value} 失败: {e}")
         
@@ -514,11 +512,8 @@ class SelfCritiqueService:
                 timeout=60.0
             )
             
-            content = response
-            json_start = content.find("{")
-            json_end = content.rfind("}") + 1
-            if json_start >= 0 and json_end > json_start:
-                return json.loads(content[json_start:json_end])
+            normalized = unwrap_markdown_json(response)
+            return json.loads(normalized)
         except Exception as e:
             logger.warning(f"快速批评失败: {e}")
         

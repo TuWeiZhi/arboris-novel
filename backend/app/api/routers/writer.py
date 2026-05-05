@@ -186,6 +186,33 @@ async def _rewrite_with_guardrails(
         logger.warning("未配置 rewrite_guardrails 提示词，跳过自动修复")
         return original_text
 
+    rewrite_input = f"""
+[原文]
+{original_text}
+
+[章节导演脚本]
+{json.dumps(chapter_mission, ensure_ascii=False, indent=2) if chapter_mission else "无"}
+
+[违规列表]
+{violations_text}
+"""
+
+    try:
+        response = await llm_service.get_llm_response(
+            system_prompt=rewrite_prompt,
+            conversation_history=[{"role": "user", "content": rewrite_input}],
+            temperature=0.3,
+            user_id=user_id,
+            timeout=300.0,
+            response_format=None,
+        )
+        cleaned = remove_think_tags(response)
+        logger.debug("护栏修复成功")
+        return cleaned
+    except Exception as exc:
+        logger.warning("护栏自动修复失败，返回原文: %s", exc)
+        return original_text
+
 
 async def _refresh_edit_summary_and_ingest(
     project_id: str,
@@ -238,39 +265,13 @@ async def _refresh_edit_summary_and_ingest(
                 chapter_number=chapter_number,
                 title=title,
                 content=content,
-                summary=None,
+                # 编辑章节时若已生成摘要则一并入库；为 None 时由 ingest 跳过摘要而非清空
+                summary=summary_text,
                 user_id=user_id or 0,
             )
             logger.info("章节 %s 向量化入库成功", chapter_number)
         except Exception as exc:
             logger.error("章节 %s 向量化入库失败: %s", chapter_number, exc)
-
-    rewrite_input = f"""
-[原文]
-{original_text}
-
-[章节导演脚本]
-{json.dumps(chapter_mission, ensure_ascii=False, indent=2) if chapter_mission else "无"}
-
-[违规列表]
-{violations_text}
-"""
-
-    try:
-        response = await llm_service.get_llm_response(
-            system_prompt=rewrite_prompt,
-            conversation_history=[{"role": "user", "content": rewrite_input}],
-            temperature=0.3,
-            user_id=user_id,
-            timeout=300.0,
-            response_format=None,
-        )
-        cleaned = remove_think_tags(response)
-        logger.info("成功修复违规内容")
-        return cleaned
-    except Exception as exc:
-        logger.warning("自动修复失败，返回原文: %s", exc)
-        return original_text
 
 
 async def _finalize_chapter_async(

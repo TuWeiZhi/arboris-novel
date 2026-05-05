@@ -372,6 +372,81 @@ class VectorStoreService:
                     item.get("chapter_number"),
                 )
 
+    async def delete_chunks_except(
+        self,
+        *,
+        project_id: str,
+        chapter_number: int,
+        keep_ids: Sequence[str],
+    ) -> None:
+        """删除指定章节中不在 keep_ids 内的旧片段，实现 upsert-then-prune 的原子语义。"""
+        if not self._client:
+            return
+
+        await self.ensure_schema()
+        await self._delete_except(
+            table="rag_chunks",
+            project_id=project_id,
+            chapter_number=chapter_number,
+            keep_ids=keep_ids,
+        )
+
+    async def delete_summaries_except(
+        self,
+        *,
+        project_id: str,
+        chapter_number: int,
+        keep_ids: Sequence[str],
+    ) -> None:
+        """删除指定章节中不在 keep_ids 内的旧摘要。"""
+        if not self._client:
+            return
+
+        await self.ensure_schema()
+        await self._delete_except(
+            table="rag_summaries",
+            project_id=project_id,
+            chapter_number=chapter_number,
+            keep_ids=keep_ids,
+        )
+
+    async def _delete_except(
+        self,
+        *,
+        table: str,
+        project_id: str,
+        chapter_number: int,
+        keep_ids: Sequence[str],
+    ) -> None:
+        """通用 prune 实现：用 json_each 展开 keep_ids，规避 SQLite 变量数上限。"""
+        # 表名为内部常量，安全；keep_ids 通过 JSON 参数化传入
+        params: Dict[str, Any] = {
+            "project_id": project_id,
+            "chapter_number": chapter_number,
+        }
+        if keep_ids:
+            params["keep_ids_json"] = json.dumps(list(keep_ids))
+            sql = f"""
+            DELETE FROM {table}
+            WHERE project_id = :project_id
+              AND chapter_number = :chapter_number
+              AND id NOT IN (SELECT value FROM json_each(:keep_ids_json))
+            """
+        else:
+            sql = f"""
+            DELETE FROM {table}
+            WHERE project_id = :project_id
+              AND chapter_number = :chapter_number
+            """
+
+        try:
+            await self._client.execute(sql, params)  # type: ignore[union-attr]
+        except Exception as exc:  # pragma: no cover
+            logger.error(
+                "Failed to prune %s: project=%s chapter=%s error=%s",
+                table, project_id, chapter_number, exc,
+            )
+
     async def delete_by_chapters(self, project_id: str, chapter_numbers: Sequence[int]) -> None:
         """根据章节编号批量删除对应的上下文数据。"""
         if not self._client or not chapter_numbers:

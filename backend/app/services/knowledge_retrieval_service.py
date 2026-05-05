@@ -605,15 +605,6 @@ class KnowledgeRetrievalService:
         return result
     
     async def _get_character_state(self, project_id: str) -> Optional[str]:
-        """获取角色状态"""
-        from ..models.memory_layer import CharacterState
-        
-        states = self.db.query(CharacterState).filter(
-            CharacterState.project_id == project_id,
-            CharacterState.character_name == "__all__"
-        ).order_by(CharacterState.chapter_number.desc()).first()
-        
-        if states and states.extra:
-            return states.extra.get("raw_state_text")
-        
-        return None
+        """获取角色状态文本，统一走共享工具的 SoT 与回退路径。"""
+        from ..utils.character_state import get_project_raw_state_text
+        return get_project_raw_state_text(self.db, project_id)

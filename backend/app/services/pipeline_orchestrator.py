@@ -8,10 +8,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import settings
+from ..models.foreshadowing import Foreshadowing
+from ..models.memory_layer import CausalChain, CharacterState
 from ..models.novel import Chapter
 from ..models.project_memory import ProjectMemory
 from ..repositories.system_config_repository import SystemConfigRepository
@@ -165,6 +167,13 @@ class PipelineOrchestrator:
 
         project_memory_text = await self._get_project_memory_text(project_id)
 
+        # 始终收集结构化记忆（角色状态/伏笔/因果链）
+        structured_memory = await self._get_structured_memory(
+            project_id=project_id,
+            chapter_number=chapter_number,
+            involved_characters=introduced_characters,
+        )
+
         rag_context = None
         knowledge_context = None
         rag_stats = None
@@ -210,6 +219,7 @@ class PipelineOrchestrator:
             forbidden_characters=forbidden_characters,
             project_memory_text=project_memory_text,
             memory_context=memory_context,
+            structured_memory=structured_memory,
         )
 
         if enhanced_flow and enhanced_context:
@@ -479,7 +489,7 @@ class PipelineOrchestrator:
         }
 
     @staticmethod
-    def _extract_tail_excerpt(text: Optional[str], limit: int = 500) -> str:
+    def _extract_tail_excerpt(text: Optional[str], limit: int = 1500) -> str:
         if not text:
             return ""
         stripped = text.strip()
@@ -647,6 +657,191 @@ class PipelineOrchestrator:
         memory_layer = MemoryLayerService(self.session, self.llm_service, self.prompt_service)
         return await memory_layer.get_memory_context(project_id, chapter_number, involved_characters)
 
+    async def _get_structured_memory(
+        self,
+        *,
+        project_id: str,
+        chapter_number: int,
+        involved_characters: List[str],
+    ) -> Optional[str]:
+        """收集结构化记忆：角色状态 + 伏笔 + 因果链，始终调用。"""
+        sections: List[str] = []
+
+        # 1. 角色当前状态：优先 ProjectMemory.extra.raw_state_text（finalize 写入），
+        #    回退到 CharacterState 表（MemoryLayerService 写入）
+        raw_state = await self._get_raw_state_text(project_id)
+        if raw_state:
+            sections.append("## 角色当前状态\n\n" + raw_state)
+        else:
+            character_states = await self._query_latest_character_states(
+                project_id, chapter_number - 1
+            )
+            if character_states:
+                lines = []
+                for state in character_states:
+                    if involved_characters and state.character_name not in involved_characters:
+                        continue
+                    parts = [f"### {state.character_name}"]
+                    if state.location:
+                        parts.append(f"- 位置：{state.location}")
+                    if state.emotion:
+                        parts.append(f"- 情绪：{state.emotion}（强度 {state.emotion_intensity}/10）")
+                    if state.health_status and state.health_status != "healthy":
+                        parts.append(f"- 健康：{state.health_status}")
+                    if state.known_secrets:
+                        parts.append(f"- 已知秘密：{', '.join(state.known_secrets[:3])}")
+                    if state.current_goals:
+                        parts.append(f"- 当前目标：{', '.join(state.current_goals[:3])}")
+                    if len(parts) > 1:
+                        lines.append("\n".join(parts))
+                if lines:
+                    sections.append("## 角色当前状态\n\n" + "\n\n".join(lines))
+
+        # 2. 活跃伏笔（planted/developing/partial + 紧迫/即将到期/超期）
+        foreshadowings = await self._query_active_foreshadowings(project_id, chapter_number)
+        if foreshadowings:
+            lines = []
+            for fs in foreshadowings:
+                label = f"第{fs.chapter_number}章埋设"
+                if fs.target_reveal_chapter:
+                    label += f"，计划第{fs.target_reveal_chapter}章回收"
+                urgency_tag = ""
+                if fs.target_reveal_chapter:
+                    diff = fs.target_reveal_chapter - chapter_number
+                    if diff < 0:
+                        urgency_tag = " [已超期]"
+                    elif diff <= 3:
+                        urgency_tag = " [即将到期]"
+                lines.append(f"- {fs.content[:100]}（{label}）{urgency_tag}")
+            if lines:
+                sections.append("## 活跃伏笔\n\n" + "\n".join(lines))
+
+        # 3. 待解决因果链
+        causal_chains = await self._query_pending_causal_chains(project_id)
+        if causal_chains:
+            lines = []
+            for chain in causal_chains[:5]:
+                chars = ""
+                if chain.involved_characters:
+                    chars = f" [涉及：{', '.join(chain.involved_characters[:3])}]"
+                lines.append(f"- 第{chain.cause_chapter}章：{chain.cause_description} → 待兑现：{chain.effect_description}{chars}")
+            if lines:
+                sections.append("## 待解决因果链\n\n" + "\n".join(lines))
+
+        if not sections:
+            return None
+        return "\n\n".join(sections)
+
+    async def _get_raw_state_text(self, project_id: str) -> Optional[str]:
+        """读取 ProjectMemory.extra.raw_state_text（finalize 写入的单一真源）。"""
+        result = await self.session.execute(
+            select(ProjectMemory).where(ProjectMemory.project_id == project_id)
+        )
+        memory = result.scalars().first()
+        if memory and memory.extra:
+            text = memory.extra.get("raw_state_text")
+            if text:
+                return text
+        return None
+
+    async def _query_latest_character_states(
+        self, project_id: str, chapter_number: int
+    ) -> list:
+        """查询各角色在指定章节的最新状态快照（按 max(chapter_number)，再按 max(id) 去重同章重复）。"""
+        max_chapter_subq = (
+            select(
+                CharacterState.character_name.label("character_name"),
+                func.max(CharacterState.chapter_number).label("max_chapter"),
+            )
+            .where(
+                and_(
+                    CharacterState.project_id == project_id,
+                    CharacterState.chapter_number <= chapter_number,
+                )
+            )
+            .group_by(CharacterState.character_name)
+            .subquery()
+        )
+
+        # 在最大章号内取最大 id，避免同章多行重复
+        max_id_subq = (
+            select(
+                CharacterState.character_name.label("character_name"),
+                CharacterState.chapter_number.label("chapter_number"),
+                func.max(CharacterState.id).label("max_id"),
+            )
+            .join(
+                max_chapter_subq,
+                and_(
+                    CharacterState.character_name == max_chapter_subq.c.character_name,
+                    CharacterState.chapter_number == max_chapter_subq.c.max_chapter,
+                ),
+            )
+            .where(CharacterState.project_id == project_id)
+            .group_by(CharacterState.character_name, CharacterState.chapter_number)
+            .subquery()
+        )
+
+        query = (
+            select(CharacterState)
+            .join(max_id_subq, CharacterState.id == max_id_subq.c.max_id)
+            .where(CharacterState.project_id == project_id)
+        )
+        result = await self.session.execute(query)
+        return list(result.scalars().all())
+
+    async def _query_active_foreshadowings(
+        self, project_id: str, chapter_number: int
+    ) -> list:
+        """查询活跃伏笔：紧迫/即将到期/超期的优先返回。"""
+        query = (
+            select(Foreshadowing)
+            .where(
+                and_(
+                    Foreshadowing.project_id == project_id,
+                    Foreshadowing.status.in_(["planted", "developing", "partial"]),
+                )
+            )
+            .order_by(Foreshadowing.chapter_number)
+        )
+        result = await self.session.execute(query)
+        all_active = list(result.scalars().all())
+
+        # 分组：overdue > due_soon > urgent > rest
+        overdue, due_soon, urgent, rest = [], [], [], []
+        for fs in all_active:
+            if fs.urgency and fs.urgency >= 8:
+                urgent.append(fs)
+            elif fs.target_reveal_chapter:
+                diff = fs.target_reveal_chapter - chapter_number
+                if diff < 0:
+                    overdue.append(fs)
+                elif diff <= 3:
+                    due_soon.append(fs)
+                else:
+                    rest.append(fs)
+            elif (chapter_number - fs.chapter_number) >= 20:
+                overdue.append(fs)
+            else:
+                rest.append(fs)
+
+        # 优先级排序，最多返回 10 条
+        return (overdue + due_soon + urgent + rest)[:10]
+
+    async def _query_pending_causal_chains(self, project_id: str) -> list:
+        """查询待解决的因果链。"""
+        result = await self.session.execute(
+            select(CausalChain)
+            .where(
+                and_(
+                    CausalChain.project_id == project_id,
+                    CausalChain.status == "pending",
+                )
+            )
+            .order_by(CausalChain.cause_chapter)
+        )
+        return list(result.scalars().all())
+
     @staticmethod
     def _build_prompt_sections(
         *,
@@ -662,6 +857,7 @@ class PipelineOrchestrator:
         forbidden_characters: List[str],
         project_memory_text: Optional[str],
         memory_context: Optional[str],
+        structured_memory: Optional[str] = None,
     ) -> List[Tuple[str, str]]:
         blueprint_text = json.dumps(writer_blueprint, ensure_ascii=False, indent=2)
         mission_text = json.dumps(chapter_mission, ensure_ascii=False, indent=2) if chapter_mission else "无导演脚本"
@@ -673,6 +869,8 @@ class PipelineOrchestrator:
 
         if project_memory_text:
             sections.append(("[项目长期记忆](摘要/剧情线)", project_memory_text))
+        if structured_memory:
+            sections.append(("[结构化记忆](角色状态/伏笔/因果链)", structured_memory))
         if memory_context:
             sections.append(("[记忆层上下文]", memory_context))
 

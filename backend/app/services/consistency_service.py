@@ -371,19 +371,11 @@ class ConsistencyService:
                 import json
                 context["plot_arcs"] = json.dumps(memory.plot_arcs, ensure_ascii=False, indent=2)
         
-        # 获取角色状态（简化版）
-        from ..models.memory_layer import CharacterState
-        states = self.db.query(CharacterState).filter(
-            CharacterState.project_id == project_id
-        ).order_by(CharacterState.chapter_number.desc()).limit(10).all()
-        
-        if states:
-            state_texts = []
-            for s in states:
-                if s.extra and "raw_state_text" in s.extra:
-                    state_texts.append(s.extra["raw_state_text"])
-                    break
-            context["character_state"] = "\n".join(state_texts) if state_texts else ""
+        # 获取角色状态：统一通过共享工具读取（ProjectMemory.extra → 历史 CharacterState 回退）
+        from ..utils.character_state import get_project_raw_state_text
+        raw_state_text = get_project_raw_state_text(self.db, project_id)
+        if raw_state_text:
+            context["character_state"] = raw_state_text
         
         # 获取未回收伏笔
         if include_foreshadowing:
