@@ -1,8 +1,19 @@
 // AIMETA P=小说状态_当前小说数据管理|R=currentNovel_chapters_fetch|NR=不含API调用|E=store:novel|X=internal|A=useNovelStore|D=pinia|S=none|RD=./README.ai
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import type { NovelProject, NovelProjectSummary, ConverseResponse, BlueprintGenerationResponse, Blueprint, DeleteNovelsResponse, ChapterOutline } from '@/api/novel'
+import { computed, ref } from 'vue'
+import type {
+  AdvancedGenerateResponse,
+  Blueprint,
+  BlueprintGenerationResponse,
+  Chapter,
+  ChapterOutline,
+  ConverseResponse,
+  DeleteNovelsResponse,
+  NovelProject,
+  NovelProjectSummary,
+} from '@/api/novel'
 import { NovelAPI } from '@/api/novel'
+import { normalizeChapterContent } from '@/utils/chapter'
 
 export const useNovelStore = defineStore('novel', () => {
   // State
@@ -16,6 +27,25 @@ export const useNovelStore = defineStore('novel', () => {
   // Getters
   const projectsCount = computed(() => projects.value.length)
   const hasCurrentProject = computed(() => currentProject.value !== null)
+
+  // 章-节号 → Chapter 的 O(1) 索引，避免频繁 .find() 线性扫描
+  function _chapterIndex(): Map<number, any> {
+    const map = new Map<number, any>()
+    if (currentProject.value && Array.isArray(currentProject.value.chapters)) {
+      for (const ch of currentProject.value.chapters) {
+        map.set(ch.chapter_number, ch)
+      }
+    }
+    return map
+  }
+
+  function _findChapter(chapterNumber: number): any | undefined {
+    if (!currentProject.value || !Array.isArray(currentProject.value.chapters)) return undefined
+    // 章节数较少时 .find() 更快（避免 Map 构建开销）；超过 20 章则走索引
+    return currentProject.value.chapters.length > 20
+      ? _chapterIndex().get(chapterNumber)
+      : currentProject.value.chapters.find(ch => ch.chapter_number === chapterNumber)
+  }
 
   // Actions
   async function loadProjects() {
@@ -145,16 +175,13 @@ export const useNovelStore = defineStore('novel', () => {
     }
   }
 
-  async function generateChapter(chapterNumber: number): Promise<NovelProject> {
-    // 注意：这里不设置全局 isLoading，因为 WritingDesk.vue 有自己的局部加载状态
+  async function generateChapter(chapterNumber: number): Promise<AdvancedGenerateResponse> {
     error.value = null
     try {
       if (!currentProject.value) {
         throw new Error('没有当前项目')
       }
-      const updatedProject = await NovelAPI.generateChapter(currentProject.value.id, chapterNumber)
-      currentProject.value = updatedProject // 更新 store 中的当前项目
-      return updatedProject
+      return await NovelAPI.generateChapter(currentProject.value.id, chapterNumber)
     } catch (err) {
       error.value = err instanceof Error ? err.message : '生成章节失败'
       throw err
@@ -280,6 +307,7 @@ export const useNovelStore = defineStore('novel', () => {
     const project = currentProject.value
     let previousContent: string | null = null
     let previousWordCount: number | undefined
+    let targetVersionId: number | null = null
     let versionIndex = -1
     if (project) {
       const chapter = project.chapters.find(ch => ch.chapter_number === chapterNumber)
@@ -288,11 +316,26 @@ export const useNovelStore = defineStore('novel', () => {
         previousWordCount = chapter.word_count
         chapter.content = content
         chapter.generation_status = 'successful'
-        chapter.word_count = content.length
-        if (Array.isArray(chapter.versions) && previousContent !== null) {
-          versionIndex = chapter.versions.findIndex(v => v === previousContent)
+        chapter.word_count = normalizeChapterContent(content).length
+        // 用版本 ID 精确匹配而非内容字符串匹配，避免多个版本内容相同时误匹配
+        if (Array.isArray(chapter.versions) && chapter.versions.length > 0) {
+          const selectedVersion = chapter.versions.find(v => v.is_selected)
+          if (selectedVersion) {
+            targetVersionId = selectedVersion.id
+            versionIndex = chapter.versions.findIndex(v => v.id === targetVersionId)
+          } else {
+            // 无已选中版本时，使用内容匹配作为回退
+            versionIndex = chapter.versions.findIndex(v => v.content === previousContent)
+            if (versionIndex >= 0) {
+              targetVersionId = chapter.versions[versionIndex].id
+            }
+          }
           if (versionIndex >= 0) {
-            chapter.versions.splice(versionIndex, 1, content)
+            const currentVersion = chapter.versions[versionIndex]
+            chapter.versions.splice(versionIndex, 1, {
+              ...currentVersion,
+              content,
+            })
           }
         }
       }
@@ -320,9 +363,19 @@ export const useNovelStore = defineStore('novel', () => {
           const chapter = project.chapters.find(ch => ch.chapter_number === chapterNumber)
           if (chapter) {
             chapter.content = previousContent
-            chapter.word_count = previousWordCount
-            if (Array.isArray(chapter.versions) && versionIndex >= 0 && previousContent !== null) {
-              chapter.versions.splice(versionIndex, 1, previousContent)
+            chapter.word_count = previousWordCount ?? 0
+            // 恢复版本：用 ID 精确匹配而非内容匹配
+            if (Array.isArray(chapter.versions)) {
+              const revertIndex = targetVersionId !== null
+                ? chapter.versions.findIndex(v => v.id === targetVersionId)
+                : -1
+              if (revertIndex >= 0) {
+                const currentVersion = chapter.versions[revertIndex]
+                chapter.versions.splice(revertIndex, 1, {
+                  ...currentVersion,
+                  content: previousContent || currentVersion.content,
+                })
+              }
             }
           }
         }
@@ -338,6 +391,30 @@ export const useNovelStore = defineStore('novel', () => {
 
   function setCurrentProject(project: NovelProject | null) {
     currentProject.value = project
+    if (!project) {
+      currentConversationState.value = {}
+    }
+  }
+
+  // 本地乐观更新辅助（供 writingDesk 等 store 使用，避免直接修改 novel store 数据）
+  function updateChapterLocal(chapterNumber: number, updates: Record<string, any>): boolean {
+    const project = currentProject.value
+    if (!project || !Array.isArray(project.chapters)) return false
+    const chapter = project.chapters.find(ch => ch.chapter_number === chapterNumber)
+    if (chapter) {
+      Object.assign(chapter, updates)
+      return true
+    }
+    return false
+  }
+
+  function addChapterLocal(chapter: Chapter): boolean {
+    if (!currentProject.value) return false
+    if (!Array.isArray(currentProject.value.chapters)) {
+      currentProject.value.chapters = []
+    }
+    currentProject.value.chapters.push(chapter)
+    return true
   }
 
   return {
@@ -366,6 +443,8 @@ export const useNovelStore = defineStore('novel', () => {
     deleteChapter,
     generateChapterOutline,
     editChapterContent,
+    updateChapterLocal,
+    addChapterLocal,
     clearError,
     setCurrentProject
   }

@@ -79,7 +79,7 @@ const getChapterStatus = (chapterNumber: number) => {
   const chapter = props.chapters.find(ch => ch.chapter_number === chapterNumber)
   if (!chapter) return '未开始'
   if (chapter.content) return '已完成'
-  if (chapter.versions && chapter.versions.length > 0) return '待选择'
+  if (chapter.generation_status === 'waiting_for_confirm' || (chapter.versions && chapter.versions.length > 0)) return '待选择'
   return '未开始'
 }
 

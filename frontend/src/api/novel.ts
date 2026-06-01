@@ -91,19 +91,23 @@ export interface ChapterOutline {
 }
 
 export interface ChapterVersion {
+  id: number
   content: string
   style?: string
+  metadata?: Record<string, any> | null
+  is_selected: boolean
 }
 
 export interface Chapter {
   chapter_number: number
   title: string
   summary: string
+  real_summary?: string | null
   content: string | null
-  versions: string[] | null  // versions是字符串数组，不是对象数组
+  versions: ChapterVersion[] | null
   evaluation: string | null
   generation_status: 'not_generated' | 'generating' | 'evaluating' | 'selecting' | 'failed' | 'evaluation_failed' | 'waiting_for_confirm' | 'successful'
-  word_count?: number  // 字数统计
+  word_count: number
 }
 
 export interface ConversationMessage {
@@ -130,11 +134,21 @@ export interface UIControl {
   placeholder?: string
 }
 
-export interface ChapterGenerationResponse {
-  versions: ChapterVersion[] // Renamed from chapter_versions for consistency
-  evaluation: string | null
-  ai_message: string
+export interface AdvancedGenerateVariant {
+  index: number
+  version_id: number
+  content: string
+  metadata?: Record<string, any> | null
+}
+
+export interface AdvancedGenerateResponse {
+  project_id: string
   chapter_number: number
+  preset: string
+  best_version_index: number
+  variants: AdvancedGenerateVariant[]
+  review_summaries: Record<string, any>
+  debug_metadata?: Record<string, any> | null
 }
 
 export interface DeleteNovelsResponse {
@@ -221,10 +235,16 @@ export class NovelAPI {
     })
   }
 
-  static async generateChapter(projectId: string, chapterNumber: number): Promise<NovelProject> {
-    return request(`${WRITER_BASE}/${projectId}/chapters/generate`, {
+  static async generateChapter(projectId: string, chapterNumber: number): Promise<AdvancedGenerateResponse> {
+    return request(`${API_BASE_URL}${WRITER_PREFIX}/advanced/generate`, {
       method: 'POST',
-      body: JSON.stringify({ chapter_number: chapterNumber })
+      body: JSON.stringify({
+        project_id: projectId,
+        chapter_number: chapterNumber,
+        flow_config: {
+          preset: 'basic'
+        }
+      })
     })
   }
 

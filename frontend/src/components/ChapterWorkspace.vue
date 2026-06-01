@@ -88,12 +88,12 @@
 
 <script setup lang="ts">
 import { globalAlert } from '@/composables/useAlert'
-import type { Chapter, ChapterOutline, ChapterGenerationResponse } from '@/api/novel'
+import type { Chapter, ChapterOutline } from '@/api/novel'
 
 interface Props {
   chapter: Chapter | null
   chapterOutline: ChapterOutline | null
-  generationResult: ChapterGenerationResponse | null
+  generationResult: any | null
 }
 
 defineProps<Props>()

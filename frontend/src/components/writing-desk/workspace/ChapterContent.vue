@@ -29,7 +29,7 @@
         <h4 class="md-title-medium font-semibold">章节内容</h4>
         <div class="flex items-center gap-3">
           <div class="md-body-small md-on-surface-variant">
-            约 {{ Math.round(cleanVersionContent(selectedChapter.content || '').length / 100) * 100 }} 字
+            约 {{ estimateChapterWordCount(selectedChapter.content) }} 字
           </div>
           <!-- 分层优化按钮 -->
           <button
@@ -201,6 +201,7 @@ import { ref } from 'vue'
 import { globalAlert } from '@/composables/useAlert'
 import type { Chapter } from '@/api/novel'
 import { OptimizerAPI } from '@/api/novel'
+import { estimateChapterWordCount, normalizeChapterContent } from '@/utils/chapter'
 
 interface Props {
   selectedChapter: Chapter
@@ -249,44 +250,7 @@ const optimizeDimensions = [
   }
 ]
 
-const cleanVersionContent = (content: string): string => {
-  if (!content) return ''
-  try {
-    const parsed = JSON.parse(content)
-    const extractContent = (value: any): string | null => {
-      if (!value) return null
-      if (typeof value === 'string') return value
-      if (Array.isArray(value)) {
-        for (const item of value) {
-          const nested = extractContent(item)
-          if (nested) return nested
-        }
-        return null
-      }
-      if (typeof value === 'object') {
-        for (const key of ['content', 'chapter_content', 'chapter_text', 'text', 'body', 'story']) {
-          if (value[key]) {
-            const nested = extractContent(value[key])
-            if (nested) return nested
-          }
-        }
-      }
-      return null
-    }
-    const extracted = extractContent(parsed)
-    if (extracted) {
-      content = extracted
-    }
-  } catch (error) {
-    // not a json
-  }
-  let cleaned = content.replace(/^"|"$/g, '')
-  cleaned = cleaned.replace(/\\n/g, '\n')
-  cleaned = cleaned.replace(/\\"/g, '"')
-  cleaned = cleaned.replace(/\\t/g, '\t')
-  cleaned = cleaned.replace(/\\\\/g, '\\')
-  return cleaned
-}
+const cleanVersionContent = (content: string): string => normalizeChapterContent(content)
 
 const sanitizeFileName = (name: string): string => {
   return name.replace(/[\\/:*?"<>|]/g, '_')

@@ -182,14 +182,14 @@
                         版本 {{ index + 1 }}
                       </h5>
                       <div class="flex items-center gap-3">
-                        <span class="text-xs text-slate-500">{{ calculateWordCount(version) }} 字</span>
+                        <span class="text-xs text-slate-500">{{ calculateWordCount(version.content) }} 字</span>
                         <span class="text-xs font-medium text-indigo-600 opacity-0 group-hover:opacity-100 transition-opacity">
                           点击查看全文 →
                         </span>
                       </div>
                     </div>
                     <div class="text-sm text-slate-700 leading-7 whitespace-pre-wrap line-clamp-4">
-                      {{ version }}
+                      {{ normalizeChapterContent(version.content) }}
                     </div>
                   </div>
                 </div>
@@ -408,6 +408,7 @@ import { NovelAPI } from '@/api/novel'
 import { AdminAPI } from '@/api/admin'
 import { useRoute } from 'vue-router'
 import { marked } from 'marked'
+import { estimateChapterWordCount, normalizeChapterContent } from '@/utils/chapter'
 
 interface ChapterItem {
   chapter_number: number
@@ -417,9 +418,15 @@ interface ChapterItem {
   word_count?: number
 }
 
+interface ChapterVersionItem {
+  content: string
+  style?: string
+  metadata?: Record<string, any> | null
+}
+
 interface ChapterDetail extends ChapterItem {
   real_summary?: string | null
-  versions?: string[] | null
+  versions?: ChapterVersionItem[] | null
   evaluation?: string | null
   generation_status?: string
 }
@@ -447,8 +454,21 @@ const versionModal = ref({
   index: 0
 })
 
-// 缓存已加载的章节详情
+// LRU 缓存已加载的章节详情（上限 20 个，超出时淘汰最旧的条目）
+const CHAPTER_CACHE_MAX = 20
 const chapterCache = new Map<number, ChapterDetail>()
+const chapterCacheOrder: number[] = []
+
+function setChapterToCache(chapterNumber: number, detail: ChapterDetail): void {
+  if (chapterCache.has(chapterNumber)) {
+    chapterCacheOrder.splice(chapterCacheOrder.indexOf(chapterNumber), 1)
+  } else if (chapterCacheOrder.length >= CHAPTER_CACHE_MAX) {
+    const evicted = chapterCacheOrder.shift()!
+    chapterCache.delete(evicted)
+  }
+  chapterCache.set(chapterNumber, detail)
+  chapterCacheOrder.push(chapterNumber)
+}
 
 const chapters = computed(() => props.chapters || [])
 
@@ -460,11 +480,7 @@ const tabs = [
 ]
 
 // 计算字数的辅助函数
-const calculateWordCount = (content: string | null | undefined): number => {
-  if (!content) return 0
-  // 移除所有空白字符后计算字数
-  return content.replace(/\s/g, '').length
-}
+const calculateWordCount = (content: string | null | undefined): number => estimateChapterWordCount(content)
 
 // 获取状态标签
 const getStatusLabel = (status: string): string => {
@@ -515,7 +531,7 @@ const exportChapterAsTxt = () => {
 
   const title = chapter.title?.trim() || `第${chapter.chapter_number}章`
   const safeTitle = sanitizeFileName(title) || `chapter-${chapter.chapter_number}`
-  const content = chapter.content ?? ''
+  const content = normalizeChapterContent(chapter.content)
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' })
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
@@ -528,10 +544,11 @@ const exportChapterAsTxt = () => {
 }
 
 // 打开版本弹窗
-const openVersionModal = (content: string, index: number) => {
+const openVersionModal = (version: string | ChapterVersionItem, index: number) => {
+  const content = typeof version === 'string' ? version : version.content
   versionModal.value = {
     show: true,
-    content,
+    content: normalizeChapterContent(content),
     index
   }
 }
@@ -621,8 +638,13 @@ const renderMarkdown = (text: string | null | undefined): string => {
 
 // 加载章节详情
 const loadChapterDetail = async (chapterNumber: number) => {
-  // 检查缓存
+  // 检查缓存，命中时刷新访问序（LRU）
   if (chapterCache.has(chapterNumber)) {
+    const idx = chapterCacheOrder.indexOf(chapterNumber)
+    if (idx >= 0) {
+      chapterCacheOrder.splice(idx, 1)
+      chapterCacheOrder.push(chapterNumber)
+    }
     selectedChapter.value = chapterCache.get(chapterNumber)!
     return
   }
@@ -635,8 +657,8 @@ const loadChapterDetail = async (chapterNumber: number) => {
       ? await AdminAPI.getNovelChapter(projectId, chapterNumber)
       : await NovelAPI.getChapter(projectId, chapterNumber)
 
-    // 存入缓存
-    chapterCache.set(chapterNumber, detail)
+    // 存入 LRU 缓存
+    setChapterToCache(chapterNumber, detail)
     selectedChapter.value = detail
   } catch (err) {
     error.value = err instanceof Error ? err.message : '加载失败'

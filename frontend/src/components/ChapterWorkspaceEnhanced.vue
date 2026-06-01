@@ -162,9 +162,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { globalAlert } from '@/composables/useAlert'
-import type { Chapter, ChapterOutline, ChapterGenerationResponse } from '@/api/novel'
+import type { Chapter, ChapterOutline } from '@/api/novel'
 import LayeredOptimizer from './LayeredOptimizer.vue'
 
 interface OptimizationRecord {
@@ -176,7 +176,7 @@ interface OptimizationRecord {
 interface Props {
   chapter: Chapter | null
   chapterOutline: ChapterOutline | null
-  generationResult: ChapterGenerationResponse | null
+  generationResult: any | null
   projectId: string
 }
 

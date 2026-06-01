@@ -48,7 +48,7 @@
     </div>
 
     <!-- AI消息 (仅对新生成的内容显示) -->
-    <div v-if="chapterGenerationResult?.ai_message" class="md-card md-card-filled p-4" style="border-radius: var(--md-radius-lg); background-color: var(--md-primary-container);">
+    <div v-if="chapterGenerationMessage" class="md-card md-card-filled p-4" style="border-radius: var(--md-radius-lg); background-color: var(--md-primary-container);">
       <div class="flex items-start gap-3">
         <div class="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0" style="background-color: var(--md-primary);">
           <svg class="w-4 h-4" style="color: var(--md-on-primary);" fill="currentColor" viewBox="0 0 20 20">
@@ -59,7 +59,7 @@
           <div 
             class="prose prose-sm max-w-none prose-headings:mt-2 prose-headings:mb-1 prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0"
             style="color: var(--md-on-primary-container);"
-            v-html="parseMarkdown(chapterGenerationResult.ai_message)"
+            v-html="parseMarkdown(chapterGenerationMessage)"
           ></div>
         </div>
       </div>
@@ -118,7 +118,7 @@
                   : 'bg-[var(--md-surface-container-highest)] text-[var(--md-on-surface-variant)]'
               ]"
             >
-              <svg v-if="isCurrentVersion(index)" class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+              <svg v-if="version.is_selected || isCurrentVersion(index)" class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
                 <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"></path>
               </svg>
               <span v-else>{{ index + 1 }}</span>
@@ -131,7 +131,7 @@
                 <span>约 {{ Math.round(cleanVersionContent(version.content).length / 100) * 100 }} 字</span>
                 <span>•</span>
                 <span>{{ version.style || '标准' }}风格</span>
-                <span v-if="isCurrentVersion(index)" style="color: var(--md-success); font-weight: 600;">• 当前选中</span>
+                <span v-if="version.is_selected || isCurrentVersion(index)" style="color: var(--md-success); font-weight: 600;">• 当前选中</span>
               </div>
               <div class="mt-2">
                 <button
@@ -180,11 +180,12 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { Chapter, ChapterGenerationResponse, ChapterVersion } from '@/api/novel'
+import type { AdvancedGenerateResponse, Chapter, ChapterVersion } from '@/api/novel'
+import { normalizeChapterContent } from '@/utils/chapter'
 
 interface Props {
   selectedChapter: Chapter | null
-  chapterGenerationResult: ChapterGenerationResponse | null
+  chapterGenerationResult: AdvancedGenerateResponse | null
   availableVersions: ChapterVersion[]
   selectedVersionIndex: number
   evaluatingChapter: number | null
@@ -196,6 +197,21 @@ const props = defineProps<Props>()
 
 defineEmits(['hideVersionSelector', 'update:selectedVersionIndex', 'showVersionDetail', 'confirmVersionSelection', 'evaluateChapter', 'showEvaluationDetail'])
 
+const chapterGenerationMessage = computed(() => {
+  if (!props.chapterGenerationResult) {
+    return ''
+  }
+
+  const bestVariant = props.chapterGenerationResult.variants[props.chapterGenerationResult.best_version_index]
+  const review = props.chapterGenerationResult.review_summaries?.ai_review
+  if (review?.evaluation) {
+    return review.evaluation
+  }
+  if (bestVariant?.metadata?.ai_review?.evaluation) {
+    return bestVariant.metadata.ai_review.evaluation
+  }
+  return ''
+})
 
 const isCurrentVersion = (versionIndex: number) => {
   if (!props.selectedChapter?.content || !props.availableVersions?.[versionIndex]?.content) return false
@@ -204,44 +220,7 @@ const isCurrentVersion = (versionIndex: number) => {
   return cleanCurrentContent === cleanVersionContentStr
 }
 
-const cleanVersionContent = (content: string): string => {
-  if (!content) return ''
-  try {
-    const parsed = JSON.parse(content)
-    const extractContent = (value: any): string | null => {
-      if (!value) return null
-      if (typeof value === 'string') return value
-      if (Array.isArray(value)) {
-        for (const item of value) {
-          const nested = extractContent(item)
-          if (nested) return nested
-        }
-        return null
-      }
-      if (typeof value === 'object') {
-        for (const key of ['content', 'chapter_content', 'chapter_text', 'text', 'body', 'story']) {
-          if (value[key]) {
-            const nested = extractContent(value[key])
-            if (nested) return nested
-          }
-        }
-      }
-      return null
-    }
-    const extracted = extractContent(parsed)
-    if (extracted) {
-      content = extracted
-    }
-  } catch (error) {
-    // not a json
-  }
-  let cleaned = content.replace(/^"|"$/g, '')
-  cleaned = cleaned.replace(/\\n/g, '\n')
-  cleaned = cleaned.replace(/\\"/g, '"')
-  cleaned = cleaned.replace(/\\t/g, '\t')
-  cleaned = cleaned.replace(/\\\\/g, '\\')
-  return cleaned
-}
+const cleanVersionContent = (content: string): string => normalizeChapterContent(content)
 
 const parseMarkdown = (text: string): string => {
   if (!text) return ''
