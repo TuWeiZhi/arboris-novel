@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence
 
 from ..core.config import settings
 
@@ -97,6 +98,8 @@ class VectorStoreService:
                 content TEXT NOT NULL,
                 embedding BLOB NOT NULL,
                 metadata TEXT,
+                embedding_model TEXT,
+                embedding_dimension INTEGER,
                 created_at INTEGER DEFAULT (unixepoch())
             )
             """,
@@ -112,6 +115,8 @@ class VectorStoreService:
                 title TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 embedding BLOB NOT NULL,
+                embedding_model TEXT,
+                embedding_dimension INTEGER,
                 created_at INTEGER DEFAULT (unixepoch())
             )
             """,
@@ -119,16 +124,284 @@ class VectorStoreService:
             CREATE INDEX IF NOT EXISTS idx_rag_summaries_project
             ON rag_summaries(project_id, chapter_number)
             """,
+            """
+            CREATE TABLE IF NOT EXISTS rag_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER DEFAULT (unixepoch())
+            )
+            """,
         ]
 
         try:
             for sql in statements:
                 await self._client.execute(sql)  # type: ignore[union-attr]
+            # 旧表升级：为已有表添加缺失列（兼容已有数据库）
+            await self._migrate_schema()
             logger.info("已确保向量库表结构存在。")
         except Exception as exc:  # pragma: no cover - 初始化失败时记录日志
             logger.error("创建向量库表结构失败: %s", exc)
         else:
             self._schema_ready = True
+
+    async def _migrate_schema(self) -> None:
+        """为旧版数据库表添加新列，兼容升级。"""
+        migrations = [
+            ("rag_chunks", "embedding_model", "TEXT"),
+            ("rag_chunks", "embedding_dimension", "INTEGER"),
+            ("rag_summaries", "embedding_model", "TEXT"),
+            ("rag_summaries", "embedding_dimension", "INTEGER"),
+        ]
+        for table, column, col_type in migrations:
+            try:
+                await self._client.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+                )
+            except Exception:
+                pass  # 列已存在时 SQLite 会报错，忽略即可
+
+    async def get_stored_model_info(self) -> Optional[Dict[str, str]]:
+        """读取向量库中记录的嵌入模型信息。"""
+        if not self._client:
+            return None
+        await self.ensure_schema()
+        try:
+            result = await self._client.execute(
+                "SELECT key, value FROM rag_meta WHERE key IN ('embedding_model', 'embedding_dimension', 'last_ingest_at')"
+            )
+            rows = self._iter_rows(result)
+            if not rows:
+                return None
+            return {row["key"]: row["value"] for row in rows}
+        except Exception:
+            return None
+
+    async def set_stored_model_info(self, model: str, dimension: int) -> None:
+        """写入当前使用的嵌入模型信息。"""
+        if not self._client:
+            return
+        await self.ensure_schema()
+        import time
+        for key, value in [("embedding_model", model), ("embedding_dimension", str(dimension)), ("last_ingest_at", str(int(time.time())))]:
+            try:
+                await self._client.execute(
+                    "INSERT INTO rag_meta (key, value, updated_at) VALUES (:key, :value, unixepoch()) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    {"key": key, "value": value},
+                )
+            except Exception as exc:
+                logger.warning("写入 rag_meta 失败: key=%s error=%s", key, exc)
+
+    async def check_model_compatibility(
+        self, current_model: str, current_dimension: int
+    ) -> Dict[str, Any]:
+        """
+        检测当前嵌入模型与向量库中已有数据是否兼容。
+
+        Returns:
+            {
+                "compatible": bool,
+                "stored_model": str or None,
+                "stored_dimension": int or None,
+                "current_model": str,
+                "current_dimension": int,
+                "reason": str,  # "match" | "first_run" | "model_changed" | "dimension_changed"
+                "stored_record_count": int,
+            }
+        """
+        stored = await self.get_stored_model_info()
+        stored_model = stored.get("embedding_model") if stored else None
+        stored_dim_str = stored.get("embedding_dimension") if stored else None
+        stored_dimension = int(stored_dim_str) if stored_dim_str else None
+
+        # 统计已有记录数
+        record_count = 0
+        if self._client:
+            try:
+                await self.ensure_schema()
+                result = await self._client.execute(
+                    "SELECT COUNT(*) AS cnt FROM rag_chunks"
+                )
+                for row in self._iter_rows(result):
+                    record_count = row.get("cnt", 0)
+                    break
+            except Exception:
+                pass
+
+        if not stored_model:
+            return {
+                "compatible": True,
+                "stored_model": None,
+                "stored_dimension": None,
+                "current_model": current_model,
+                "current_dimension": current_dimension,
+                "reason": "first_run",
+                "stored_record_count": record_count,
+            }
+
+        if stored_model != current_model:
+            return {
+                "compatible": False,
+                "stored_model": stored_model,
+                "stored_dimension": stored_dimension,
+                "current_model": current_model,
+                "current_dimension": current_dimension,
+                "reason": "model_changed",
+                "stored_record_count": record_count,
+            }
+
+        if stored_dimension and stored_dimension != current_dimension:
+            return {
+                "compatible": False,
+                "stored_model": stored_model,
+                "stored_dimension": stored_dimension,
+                "current_model": current_model,
+                "current_dimension": current_dimension,
+                "reason": "dimension_changed",
+                "stored_record_count": record_count,
+            }
+
+        return {
+            "compatible": True,
+            "stored_model": stored_model,
+            "stored_dimension": stored_dimension,
+            "current_model": current_model,
+            "current_dimension": current_dimension,
+            "reason": "match",
+            "stored_record_count": record_count,
+        }
+
+    async def rebuild_vectors(
+        self,
+        *,
+        project_id: str,
+        chapters_data: List[Dict[str, Any]],
+        llm_service: Any,
+        user_id: int,
+        chunk_size: int = 500,
+        chunk_overlap: int = 100,
+    ) -> Dict[str, Any]:
+        """
+        用当前嵌入模型重新生成所有向量数据（模型变更后的恢复操作）。
+
+        Args:
+            project_id: 小说项目 ID
+            chapters_data: [{"chapter_number": int, "title": str, "content": str, "summary": str}, ...]
+            llm_service: LLMService 实例
+            user_id: 用户 ID
+            chunk_size: 切分大小
+            chunk_overlap: 重叠大小
+
+        Returns:
+            {"rebuilt_chapters": int, "total_chunks": int, "total_summaries": int, "errors": int}
+        """
+        if not self._client:
+            return {"rebuilt_chapters": 0, "total_chunks": 0, "total_summaries": 0, "errors": 0}
+
+        await self.ensure_schema()
+
+        # 先清空该项目的所有旧向量
+        try:
+            await self._client.execute(
+                "DELETE FROM rag_chunks WHERE project_id = :pid", {"pid": project_id}
+            )
+            await self._client.execute(
+                "DELETE FROM rag_summaries WHERE project_id = :pid", {"pid": project_id}
+            )
+            logger.info("已清空项目 %s 的旧向量数据", project_id)
+        except Exception as exc:
+            logger.warning("清空旧向量失败: %s", exc)
+
+        total_chunks = 0
+        total_summaries = 0
+        errors = 0
+
+        # 导入切分器
+        try:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+            splitter = RecursiveCharacterTextSplitter(
+                separators=["\n\n", "\n", "。", "！", "？", "!", "?", "；", ";", "，", ",", " "],
+                chunk_size=chunk_size,
+                chunk_overlap=min(chunk_overlap, chunk_size // 2),
+                keep_separator=False,
+                strip_whitespace=True,
+            )
+        except ImportError:
+            splitter = None
+
+        for ch in chapters_data:
+            ch_num = ch["chapter_number"]
+            title = ch.get("title", f"第{ch_num}章")
+            content = ch.get("content", "")
+            summary = ch.get("summary", "")
+
+            # 切分正文
+            if splitter and content.strip():
+                chunks = [s.strip() for s in splitter.split_text(content.strip()) if s.strip()]
+            elif content.strip():
+                chunks = [content.strip()]
+            else:
+                chunks = []
+
+            # 生成正文向量
+            chunk_records = []
+            for idx, chunk_text in enumerate(chunks):
+                try:
+                    embedding = await llm_service.get_embedding(chunk_text, user_id=user_id)
+                    if embedding:
+                        record_id = f"{project_id}:{ch_num}:{idx}"
+                        chunk_records.append({
+                            "id": record_id,
+                            "project_id": project_id,
+                            "chapter_number": ch_num,
+                            "chunk_index": idx,
+                            "chapter_title": title,
+                            "content": chunk_text,
+                            "embedding": embedding,
+                            "metadata": {"chunk_id": record_id, "length": len(chunk_text)},
+                        })
+                except Exception as exc:
+                    logger.warning("重建向量失败: project=%s chapter=%s chunk=%s error=%s", project_id, ch_num, idx, exc)
+                    errors += 1
+
+            if chunk_records:
+                await self.upsert_chunks(records=chunk_records)
+                total_chunks += len(chunk_records)
+
+            # 生成摘要向量
+            if summary.strip():
+                try:
+                    summary_embedding = await llm_service.get_embedding(summary.strip(), user_id=user_id)
+                    if summary_embedding:
+                        await self.upsert_summaries(records=[{
+                            "id": f"{project_id}:{ch_num}:summary",
+                            "project_id": project_id,
+                            "chapter_number": ch_num,
+                            "title": title,
+                            "summary": summary.strip(),
+                            "embedding": summary_embedding,
+                        }])
+                        total_summaries += 1
+                except Exception as exc:
+                    logger.warning("重建摘要向量失败: project=%s chapter=%s error=%s", project_id, ch_num, exc)
+                    errors += 1
+
+        # 记录当前模型信息
+        current_model = await llm_service.get_embedding_model_name()
+        current_dim = await llm_service.get_embedding_dimension(current_model)
+        if current_model and current_dim:
+            await self.set_stored_model_info(current_model, current_dim)
+
+        logger.info(
+            "向量重建完成: project=%s chapters=%d chunks=%d summaries=%d errors=%d",
+            project_id, len(chapters_data), total_chunks, total_summaries, errors,
+        )
+        return {
+            "rebuilt_chapters": len(chapters_data),
+            "total_chunks": total_chunks,
+            "total_summaries": total_summaries,
+            "errors": errors,
+        }
 
     async def query_chunks(
         self,
@@ -256,6 +529,8 @@ class VectorStoreService:
         self,
         *,
         records: Iterable[Dict[str, Any]],
+        embedding_model: Optional[str] = None,
+        embedding_dimension: Optional[int] = None,
     ) -> None:
         """批量写入章节片段，供后续检索使用。"""
         if not self._client:
@@ -271,7 +546,9 @@ class VectorStoreService:
             chapter_title,
             content,
             embedding,
-            metadata
+            metadata,
+            embedding_model,
+            embedding_dimension
         ) VALUES (
             :id,
             :project_id,
@@ -280,45 +557,53 @@ class VectorStoreService:
             :chapter_title,
             :content,
             :embedding,
-            :metadata
+            :metadata,
+            :embedding_model,
+            :embedding_dimension
         )
         ON CONFLICT(id) DO UPDATE SET
             content=excluded.content,
             embedding=excluded.embedding,
             metadata=excluded.metadata,
-            chapter_title=excluded.chapter_title
+            chapter_title=excluded.chapter_title,
+            embedding_model=excluded.embedding_model,
+            embedding_dimension=excluded.embedding_dimension
         """
         payload = []
         for item in records:
             embedding = item.get("embedding", [])
-            payload.append(
-                {
-                    **item,
-                    "embedding": self._to_f32_blob(embedding),
-                    "metadata": json.dumps(item.get("metadata") or {}, ensure_ascii=False),
-                }
-            )
+            record = {
+                **item,
+                "embedding": self._to_f32_blob(embedding),
+                "metadata": json.dumps(item.get("metadata") or {}, ensure_ascii=False),
+                "embedding_model": embedding_model or item.get("embedding_model"),
+                "embedding_dimension": embedding_dimension or len(embedding),
+            }
+            payload.append(record)
 
         if not payload:
             return
 
-        for item in payload:
-            try:
-                await self._client.execute(sql, item)  # type: ignore[union-attr]
-            except Exception as exc:  # pragma: no cover - 单条写入失败时记录日志
-                logger.error("写入 rag_chunks 失败: %s", exc)
-            else:
-                logger.debug(
-                    "已写入章节片段: project=%s chapter=%s chunk=%s",
-                    item.get("project_id"),
-                    item.get("chapter_number"),
-                    item.get("chunk_index"),
-                )
+        # 批量写入：使用 batch() 而非逐条 execute() 以减少网络往返
+        try:
+            stmts = [libsql_client.Statement(sql, item) for item in payload]
+            await self._client.batch(stmts)  # type: ignore[union-attr]
+        except Exception as exc:  # pragma: no cover - 批量写入失败时回退至逐条
+            logger.warning("向量批量写入失败，回退至逐条写入: %s", exc)
+            for item in payload:
+                try:
+                    await self._client.execute(sql, item)  # type: ignore[union-attr]
+                except Exception as item_exc:
+                    logger.error("写入 rag_chunks 失败: %s", item_exc)
+        else:
+            logger.debug("批量写入 rag_chunks 完成: %d 条", len(payload))
 
     async def upsert_summaries(
         self,
         *,
         records: Iterable[Dict[str, Any]],
+        embedding_model: Optional[str] = None,
+        embedding_dimension: Optional[int] = None,
     ) -> None:
         """同步章节摘要向量，供摘要层检索使用。"""
         if not self._client:
@@ -332,45 +617,53 @@ class VectorStoreService:
             chapter_number,
             title,
             summary,
-            embedding
+            embedding,
+            embedding_model,
+            embedding_dimension
         ) VALUES (
             :id,
             :project_id,
             :chapter_number,
             :title,
             :summary,
-            :embedding
+            :embedding,
+            :embedding_model,
+            :embedding_dimension
         )
         ON CONFLICT(id) DO UPDATE SET
             summary=excluded.summary,
             embedding=excluded.embedding,
-            title=excluded.title
+            title=excluded.title,
+            embedding_model=excluded.embedding_model,
+            embedding_dimension=excluded.embedding_dimension
         """
 
         payload = []
         for item in records:
             embedding = item.get("embedding", [])
-            payload.append(
-                {
-                    **item,
-                    "embedding": self._to_f32_blob(embedding),
-                }
-            )
+            record = {
+                **item,
+                "embedding": self._to_f32_blob(embedding),
+                "embedding_model": embedding_model or item.get("embedding_model"),
+                "embedding_dimension": embedding_dimension or len(embedding),
+            }
+            payload.append(record)
 
         if not payload:
             return
 
-        for item in payload:
-            try:
-                await self._client.execute(sql, item)  # type: ignore[union-attr]
-            except Exception as exc:  # pragma: no cover - 单条写入失败时记录日志
-                logger.error("写入 rag_summaries 失败: %s", exc)
-            else:
-                logger.debug(
-                    "已写入章节摘要: project=%s chapter=%s",
-                    item.get("project_id"),
-                    item.get("chapter_number"),
-                )
+        try:
+            stmts = [libsql_client.Statement(sql, item) for item in payload]
+            await self._client.batch(stmts)  # type: ignore[union-attr]
+        except Exception as exc:  # pragma: no cover - 批量写入失败时回退至逐条
+            logger.warning("摘要向量批量写入失败，回退至逐条写入: %s", exc)
+            for item in payload:
+                try:
+                    await self._client.execute(sql, item)  # type: ignore[union-attr]
+                except Exception as item_exc:
+                    logger.error("写入 rag_summaries 失败: %s", item_exc)
+        else:
+            logger.debug("批量写入 rag_summaries 完成: %d 条", len(payload))
 
     async def delete_chunks_except(
         self,
@@ -485,6 +778,117 @@ class VectorStoreService:
         return array("f", embedding).tobytes()
 
     @staticmethod
+    def _from_f32_blob(blob: bytes) -> array:
+        """将 float32 二进制 blob 解码为 array('f')。"""
+        arr = array('f')
+        arr.frombytes(blob) if isinstance(blob, bytes) else None
+        return arr
+
+    # ------------------------------------------------------------------
+    # 章节写入与检索（原 VectorStoreServiceExt 的高层封装）
+    # ------------------------------------------------------------------
+    async def add_chapter_to_store(
+        self,
+        *,
+        project_id: str,
+        chapter_number: int,
+        content: str,
+        chapter_title: Optional[str] = None,
+        chunk_size: int = 500,
+        chunk_overlap: int = 100,
+        embedding_func: Callable[[str], Awaitable[Optional[List[float]]]],
+        embedding_model: Optional[str] = None,
+        embedding_dimension: Optional[int] = None,
+    ) -> int:
+        """将章节内容分块、生成嵌入并写入向量库，返回写入的块数。"""
+        if not self._client:
+            return 0
+
+        await self.ensure_schema()
+
+        # 先删除旧数据
+        await self.delete_by_chapters(project_id, [chapter_number])
+
+        chunks = self._split_text(content, chunk_size, chunk_overlap)
+        if not chunks:
+            return 0
+
+        records = []
+        for idx, chunk_text in enumerate(chunks):
+            embedding = await embedding_func(chunk_text)
+            if embedding:
+                records.append({
+                    "id": f"{project_id}:{chapter_number}:{idx}",
+                    "project_id": project_id,
+                    "chapter_number": chapter_number,
+                    "chunk_index": idx,
+                    "chapter_title": chapter_title,
+                    "content": chunk_text,
+                    "embedding": embedding,
+                    "metadata": {"source": "chapter", "chunk_index": idx, "total_chunks": len(chunks)},
+                })
+
+        if records:
+            await self.upsert_chunks(
+                records=records,
+                embedding_model=embedding_model,
+                embedding_dimension=embedding_dimension or len(records[0]["embedding"]),
+            )
+
+        logger.info("已写入章节向量: project=%s chapter=%s chunks=%d", project_id, chapter_number, len(records))
+        return len(records)
+
+    @staticmethod
+    def _split_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+        """按段落优先分割文本块，保持语义完整性。"""
+        if not text:
+            return []
+
+        paragraphs = re.split(r'\n\s*\n', text)
+        chunks: List[str] = []
+        current = ""
+
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            if len(current) + len(para) > chunk_size:
+                if current:
+                    chunks.append(current)
+                if len(para) > chunk_size:
+                    sentences = re.split(r'([。！？.!?])', para)
+                    temp = ""
+                    for i in range(0, len(sentences), 2):
+                        sentence = sentences[i] + (sentences[i + 1] if i + 1 < len(sentences) else "")
+                        if len(temp) + len(sentence) > chunk_size:
+                            if temp:
+                                chunks.append(temp)
+                            temp = sentence
+                        else:
+                            temp += sentence
+                    current = temp
+                else:
+                    current = para
+            else:
+                current = f"{current}\n\n{para}" if current else para
+
+        if current:
+            chunks.append(current)
+
+        # 添加重叠以保持上下文连续性
+        if chunk_overlap > 0 and len(chunks) > 1:
+            overlapped = []
+            for i, chunk in enumerate(chunks):
+                if i > 0:
+                    prev = chunks[i - 1]
+                    overlap_text = prev[-chunk_overlap:] if len(prev) > chunk_overlap else prev
+                    chunk = f"{overlap_text}...{chunk}"
+                overlapped.append(chunk)
+            return overlapped
+
+        return chunks
+
+    @staticmethod
     def _from_f32_blob(blob: Any) -> List[float]:
         """将数据库中的 BLOB 解码为浮点列表。"""
         if not blob:
@@ -496,17 +900,17 @@ class VectorStoreService:
         return list(data)
 
     @staticmethod
-    def _cosine_distance(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
-        """计算余弦距离（1 - similarity），避免除零。"""
-        if not vec_a or not vec_b:
+    def _cosine_distance(query_a: "array", vec_b: Sequence[float]) -> float:
+        """余弦距离（1 - similarity），使用 array("f") 加速计算。"""
+        if len(query_a) == 0 or not vec_b:
             return 1.0
-        dot = sum(a * b for a, b in zip(vec_a, vec_b))
-        norm_a = math.sqrt(sum(a * a for a in vec_a))
-        norm_b = math.sqrt(sum(b * b for b in vec_b))
+        b = array("f", vec_b)
+        dot = sum(a * b for a, b in zip(query_a, b))
+        norm_a = math.sqrt(sum(a * a for a in query_a))
+        norm_b = math.sqrt(sum(b * b for b in b))
         if norm_a == 0 or norm_b == 0:
             return 1.0
-        similarity = dot / (norm_a * norm_b)
-        return 1.0 - similarity
+        return 1.0 - (dot / (norm_a * norm_b))
 
     async def _query_chunks_with_python_similarity(
         self,

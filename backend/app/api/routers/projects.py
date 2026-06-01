@@ -256,3 +256,82 @@ async def put_factions(
             saved.append(await faction_service.create_faction(project_id, data))
 
     return {"project_id": project_id, "factions": [_model_to_dict(faction) for faction in saved]}
+
+
+@router.get("/{project_id}/vector-compatibility")
+async def check_vector_compatibility(
+    project_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: UserInDB = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """检测当前嵌入模型与向量库已有数据是否兼容。"""
+    novel_service = NovelService(session)
+    await novel_service.ensure_project_owner(project_id, current_user.id)
+
+    from ...services.vector_store_service import VectorStoreService
+    from ...core.config import settings
+
+    if not settings.vector_store_enabled:
+        return {"compatible": True, "reason": "vector_store_disabled", "stored_record_count": 0}
+
+    try:
+        vector_store = VectorStoreService()
+    except RuntimeError:
+        return {"compatible": True, "reason": "vector_store_init_failed", "stored_record_count": 0}
+
+    llm_service = LLMService(session)
+    current_model = await llm_service._get_config_value("embedding.model") or "unknown"
+    current_dimension = await llm_service.get_embedding_dimension()
+
+    compat = await vector_store.check_model_compatibility(current_model, current_dimension or 0)
+    return compat
+
+
+@router.post("/{project_id}/vector-rebuild")
+async def rebuild_project_vectors(
+    project_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: UserInDB = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """用当前嵌入模型重新生成该项目的所有向量数据。"""
+    novel_service = NovelService(session)
+    project = await novel_service.ensure_project_owner(project_id, current_user.id)
+
+    from ...services.vector_store_service import VectorStoreService
+    from ...services.chapter_ingest_service import ChapterIngestionService
+    from ...core.config import settings
+
+    if not settings.vector_store_enabled:
+        raise HTTPException(status_code=400, detail="向量库未启用")
+
+    try:
+        vector_store = VectorStoreService()
+    except RuntimeError:
+        raise HTTPException(status_code=500, detail="向量库初始化失败")
+
+    llm_service = LLMService(session)
+
+    # 收集所有已选版本的章节数据
+    chapters_data = []
+    for chapter in project.chapters:
+        if chapter.selected_version and chapter.selected_version.content:
+            chapters_data.append({
+                "chapter_number": chapter.chapter_number,
+                "title": next(
+                    (o.title for o in project.outlines if o.chapter_number == chapter.chapter_number),
+                    f"第{chapter.chapter_number}章",
+                ),
+                "content": chapter.selected_version.content,
+                "summary": chapter.real_summary or "",
+            })
+
+    if not chapters_data:
+        return {"status": "ok", "message": "没有需要重建的章节", "rebuilt_chapters": 0}
+
+    result = await vector_store.rebuild_vectors(
+        project_id=project_id,
+        chapters_data=chapters_data,
+        llm_service=llm_service,
+        user_id=current_user.id,
+    )
+    return {"status": "ok", **result}

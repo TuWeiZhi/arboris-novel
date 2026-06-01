@@ -7,6 +7,7 @@ from __future__ import annotations
 全部注释使用中文，方便团队成员阅读理解。
 """
 
+import asyncio
 import logging
 from typing import Dict, List, Optional, Sequence
 
@@ -15,6 +16,9 @@ from ..services.llm_service import LLMService
 from ..services.vector_store_service import VectorStoreService
 
 logger = logging.getLogger(__name__)
+
+# 向量入库并发限制 — 防止大量 chunk 同时调用 embedding API
+_EMBED_CONCURRENCY = 10
 
 try:  # noqa: SIM105 - 提示缺少可选依赖
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -35,6 +39,25 @@ class ChapterIngestionService:
         self._vector_store = vector_store or VectorStoreService()
         self._text_splitter = self._init_text_splitter()
 
+    async def check_embedding_model_compatibility(self) -> Dict[str, Any]:
+        """
+        检测当前嵌入模型与向量库已有数据是否兼容。
+        在入库前调用，返回兼容性报告。
+        """
+        current_model = await self._llm_service.get_embedding_model_name()
+        current_dimension = await self._llm_service.get_embedding_dimension(current_model)
+        if not current_dimension:
+            # 尝试通过实际调用获取维度
+            try:
+                test_embedding = await self._llm_service.get_embedding("test", user_id=0)
+                current_dimension = len(test_embedding) if test_embedding else 0
+            except Exception:
+                current_dimension = 0
+
+        return await self._vector_store.check_model_compatibility(
+            current_model, current_dimension or 0
+        )
+
     async def ingest_chapter(
         self,
         *,
@@ -45,46 +68,66 @@ class ChapterIngestionService:
         summary: Optional[str],
         user_id: int,
         purge_summary: bool = False,
-    ) -> None:
-        """将章节正文与摘要写入向量库，供后续 RAG 检索使用。
+    ) -> Dict[str, Any]:
+        """
+        将章节正文与摘要写入向量库，供后续 RAG 检索使用。
 
-        Args:
-            summary: 新摘要文本；为 None 或空表示"跳过摘要更新"，不会删除已有摘要。
-            purge_summary: 显式要求清空该章节摘要向量（如章节被回滚），仅在确实需要时使用。
+        Returns:
+            {"status": "ok" | "skipped" | "model_mismatch", "details": ...}
         """
         if not settings.vector_store_enabled:
             logger.warning("向量库未启用，跳过章节向量写入: project=%s chapter=%s", project_id, chapter_number)
-            return
+            return {"status": "skipped", "reason": "vector_store_disabled"}
         if not content.strip():
             logger.warning("章节正文为空，跳过向量写入: project=%s chapter=%s", project_id, chapter_number)
-            return
+            return {"status": "skipped", "reason": "empty_content"}
+
+        # 获取当前嵌入模型信息
+        current_model = await self._llm_service.get_embedding_model_name()
+        current_dimension = await self._llm_service.get_embedding_dimension(current_model)
 
         chunks = self._split_into_chunks(content)
         if not chunks:
             logger.warning("章节正文切分后为空，跳过向量写入: project=%s chapter=%s", project_id, chapter_number)
-            return
+            return {"status": "skipped", "reason": "empty_chunks"}
 
         logger.info(
-            "开始写入章节向量: project=%s chapter=%s chunks=%d",
+            "开始写入章节向量: project=%s chapter=%s chunks=%d model=%s",
             project_id,
             chapter_number,
             len(chunks),
+            current_model,
+        )
+
+        # 并发生成嵌入向量（带并发限制）
+        _sem = asyncio.Semaphore(_EMBED_CONCURRENCY)
+
+        async def _embed_with_model(text: str) -> Optional[List[float]]:
+            async with _sem:
+                return await self._llm_service.get_embedding(text, user_id=user_id)
+
+        embedding_results = await asyncio.gather(
+            *[_embed_with_model(chunk_text) for chunk_text in chunks],
+            return_exceptions=True,
         )
 
         chunk_records = []
-        for index, chunk_text in enumerate(chunks):
-            embedding = await self._llm_service.get_embedding(
-                chunk_text,
-                user_id=user_id,
-            )
+        for index, (chunk_text, embedding) in enumerate(zip(chunks, embedding_results)):
+            if isinstance(embedding, Exception):
+                logger.warning(
+                    "生成章节片段向量异常: project=%s chapter=%s chunk=%s error=%s",
+                    project_id, chapter_number, index, embedding,
+                )
+                continue
             if not embedding:
                 logger.warning(
                     "生成章节片段向量失败，已跳过: project=%s chapter=%s chunk=%s",
-                    project_id,
-                    chapter_number,
-                    index,
+                    project_id, chapter_number, index,
                 )
                 continue
+            # 更新实际维度（首次调用后才知道）
+            if not current_dimension:
+                current_dimension = len(embedding)
             record_id = f"{project_id}:{chapter_number}:{index}"
             chunk_records.append(
                 {
@@ -103,7 +146,11 @@ class ChapterIngestionService:
             )
 
         if chunk_records:
-            await self._vector_store.upsert_chunks(records=chunk_records)
+            await self._vector_store.upsert_chunks(
+                records=chunk_records,
+                embedding_model=current_model,
+                embedding_dimension=current_dimension,
+            )
             # 清理旧片段（upsert-then-prune，避免先删后写导致数据丢失）
             await self._vector_store.delete_chunks_except(
                 project_id=project_id,
@@ -136,7 +183,9 @@ class ChapterIngestionService:
                                 "summary": cleaned_summary,
                                 "embedding": summary_embedding,
                             }
-                        ]
+                        ],
+                        embedding_model=current_model,
+                        embedding_dimension=current_dimension or len(summary_embedding),
                     )
                     await self._vector_store.delete_summaries_except(
                         project_id=project_id,
@@ -166,7 +215,12 @@ class ChapterIngestionService:
                 project_id,
                 chapter_number,
             )
-        # summary 为 None/空 且未要求 purge → 静默跳过摘要部分，保留已有数据
+
+        # 更新全局模型记录
+        if current_model and current_dimension:
+            await self._vector_store.set_stored_model_info(current_model, current_dimension)
+
+        return {"status": "ok", "chunks": len(chunk_records), "model": current_model, "dimension": current_dimension}
 
     async def delete_chapters(self, project_id: str, chapter_numbers: Sequence[int]) -> None:
         """从向量库中删除指定章节的所有片段与摘要。"""

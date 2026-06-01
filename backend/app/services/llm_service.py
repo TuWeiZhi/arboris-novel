@@ -1,4 +1,5 @@
 # AIMETA P=LLM服务_大模型调用封装|R=API调用_流式生成|NR=不含业务逻辑|E=LLMService|X=internal|A=服务类|D=openai,httpx|S=net|RD=./README.ai
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,10 @@ from ..services.usage_service import UsageService
 from ..utils.llm_tool import ChatMessage, LLMClient
 
 logger = logging.getLogger(__name__)
+
+# LLM 重试配置
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 1.0  # 指数退避起始延迟（秒）
 
 try:  # pragma: no cover - 运行环境未安装时兼容
     from ollama import AsyncClient as OllamaAsyncClient
@@ -116,8 +121,53 @@ class LLMService:
         top_p: Optional[float] = None,
     ) -> str:
         config = await self._resolve_llm_config(user_id)
-        client = LLMClient(api_key=config["api_key"], base_url=config.get("base_url"))
 
+        # 指数退避重试：仅对临时性连接/超时错误重试，业务错误直接抛出
+        retryable = (httpx.RemoteProtocolError, httpx.ReadTimeout, APIConnectionError, APITimeoutError)
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
+            try:
+                return await self._do_single_stream(
+                    config, messages, temperature, user_id, timeout,
+                    response_format, max_tokens, top_p,
+                )
+            except HTTPException:
+                raise
+            except retryable as exc:
+                last_exc = exc
+                if attempt >= _RETRY_MAX_ATTEMPTS:
+                    break
+                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "LLM stream retry %d/%d after %.1fs: model=%s user_id=%s",
+                    attempt, _RETRY_MAX_ATTEMPTS, delay, config.get("model"), user_id,
+                )
+                await asyncio.sleep(delay)
+            except Exception:
+                # 非预期异常不重试，避免掩盖真正的缺陷
+                raise
+
+        # 所有重试已耗尽
+        detail = "AI 服务暂时不可用，已重试多次仍失败，请稍后重试"
+        logger.error(
+            "LLM stream retries exhausted: model=%s user_id=%s attempts=%d",
+            config.get("model"), user_id, _RETRY_MAX_ATTEMPTS,
+        )
+        raise HTTPException(status_code=503, detail=detail) from last_exc
+
+    async def _do_single_stream(
+        self,
+        config: Dict[str, Optional[str]],
+        messages: List[Dict[str, str]],
+        temperature: float,
+        user_id: Optional[int],
+        timeout: float,
+        response_format: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ) -> str:
+        """单次 LLM 流式调用（不含重试逻辑）。"""
+        client = LLMClient(api_key=config["api_key"], base_url=config.get("base_url"))
         chat_messages = [ChatMessage(role=msg["role"], content=msg["content"]) for msg in messages]
 
         full_response = ""
@@ -255,14 +305,14 @@ class LLMService:
         user_id: Optional[int] = None,
         model: Optional[str] = None,
     ) -> List[float]:
-        """生成文本向量，用于章节 RAG 检索，支持 openai 与 ollama 双提供方。"""
+        """生成文本向量，用于章节 RAG 检索，支持 openai 与 ollama 双提供方。支持 MRL 维度截断。"""
         provider = await self._get_config_value("embedding.provider") or "openai"
-        default_model = (
-            await self._get_config_value("ollama.embedding_model") or "nomic-embed-text:latest"
-            if provider == "ollama"
-            else await self._get_config_value("embedding.model") or "text-embedding-3-large"
-        )
+        default_model = await self.get_embedding_model_name(provider=provider)
         target_model = model or default_model
+
+        # 读取 MRL 维度配置
+        vector_size_str = await self._get_config_value("embedding.model_vector_size")
+        dimensions = int(vector_size_str) if vector_size_str else None
 
         if provider == "ollama":
             if OllamaAsyncClient is None:
@@ -296,15 +346,24 @@ class LLMService:
             if not isinstance(embedding, list):
                 embedding = list(embedding)
         else:
-            config = await self._resolve_llm_config(user_id)
-            api_key = await self._get_config_value("embedding.api_key") or config["api_key"]
-            base_url = await self._get_config_value("embedding.base_url") or config.get("base_url")
+            embedding_api_key = await self._get_config_value("embedding.api_key")
+            embedding_base_url = await self._get_config_value("embedding.base_url")
+            if embedding_api_key:
+                api_key = embedding_api_key
+                base_url = embedding_base_url or str(settings.embedding_base_url)
+            else:
+                config = await self._resolve_llm_config(user_id)
+                api_key = config["api_key"]
+                base_url = embedding_base_url or config.get("base_url") or str(settings.embedding_base_url)
             client = AsyncOpenAI(api_key=api_key, base_url=base_url)
             try:
-                response = await client.embeddings.create(
-                    input=text,
-                    model=target_model,
-                )
+                kwargs: Dict[str, Any] = {
+                    "input": text,
+                    "model": target_model,
+                }
+                if dimensions:
+                    kwargs["dimensions"] = dimensions
+                response = await client.embeddings.create(**kwargs)
             except Exception as exc:  # pragma: no cover - 网络或鉴权失败
                 logger.error(
                     "OpenAI 嵌入请求失败: model=%s base_url=%s user_id=%s error=%s",
@@ -324,27 +383,25 @@ class LLMService:
             embedding = list(embedding)
 
         dimension = len(embedding)
-        if not dimension:
-            vector_size_str = await self._get_config_value("embedding.model_vector_size")
-            if vector_size_str:
-                dimension = int(vector_size_str)
         if dimension:
             self._embedding_dimensions[target_model] = dimension
         return embedding
 
     async def get_embedding_dimension(self, model: Optional[str] = None) -> Optional[int]:
         """获取嵌入向量维度，优先返回缓存结果，其次读取配置。"""
-        provider = await self._get_config_value("embedding.provider") or "openai"
-        default_model = (
-            await self._get_config_value("ollama.embedding_model") or "nomic-embed-text:latest"
-            if provider == "ollama"
-            else await self._get_config_value("embedding.model") or "text-embedding-3-large"
-        )
+        default_model = await self.get_embedding_model_name()
         target_model = model or default_model
         if target_model in self._embedding_dimensions:
             return self._embedding_dimensions[target_model]
         vector_size_str = await self._get_config_value("embedding.model_vector_size")
         return int(vector_size_str) if vector_size_str else None
+
+    async def get_embedding_model_name(self, *, provider: Optional[str] = None) -> str:
+        """返回当前实际使用的嵌入模型名称。"""
+        provider = provider or await self._get_config_value("embedding.provider") or "openai"
+        if provider == "ollama":
+            return await self._get_config_value("ollama.embedding_model") or "nomic-embed-text:latest"
+        return await self._get_config_value("embedding.model") or "Qwen/Qwen3-Embedding-8B"
 
     async def _enforce_daily_limit(self, user_id: int) -> None:
         limit_str = await self.admin_setting_service.get("daily_request_limit", "100")

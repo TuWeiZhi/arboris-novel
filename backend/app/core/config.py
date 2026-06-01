@@ -9,7 +9,20 @@ from sqlalchemy.engine import URL, make_url
 
 
 class Settings(BaseSettings):
-    """应用全局配置，所有可调参数集中于此，统一加载自环境变量。"""
+    """
+    应用全局配置，所有可调参数集中于此。
+
+    配置优先级（高→低）：
+    1. 环境变量 (e.g. EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B)
+    2. .env 文件 (backend/.env → .env → new-backend/.env)
+    3. 此处定义的 default 值
+
+    注意：
+    - 部署级配置（密钥、数据库连接等）使用环境变量
+    - 运行时可变配置（如 API Key、模型名称）通过 system_config 数据库表管理，
+      首次启动时自动从环境变量/默认值迁移到数据库
+    - 不可变系统参数（如 JWT 算法）在此硬编码
+    """
 
     # -------------------- 基础应用配置 --------------------
     app_name: str = Field(default="AI Novel Generator API", description="FastAPI 文档标题")
@@ -89,7 +102,7 @@ class Settings(BaseSettings):
         description="嵌入模型提供方，支持 openai 或 ollama",
     )
     embedding_base_url: Optional[AnyUrl] = Field(
-        default=None,
+        default="https://api.siliconflow.cn/v1",
         env="EMBEDDING_BASE_URL",
         description="嵌入模型使用的 Base URL",
     )
@@ -99,15 +112,15 @@ class Settings(BaseSettings):
         description="嵌入模型专用 API Key",
     )
     embedding_model: str = Field(
-        default="text-embedding-3-large",
+        default="Qwen/Qwen3-Embedding-8B",
         env="EMBEDDING_MODEL",
         validation_alias=AliasChoices("EMBEDDING_MODEL", "VECTOR_EMBEDDING_MODEL"),
         description="默认的嵌入模型名称",
     )
-    embedding_model_vector_size: Optional[int] = Field(
-        default=None,
+    embedding_model_vector_size: int = Field(
+        default=1024,
         env="EMBEDDING_MODEL_VECTOR_SIZE",
-        description="嵌入向量维度，未配置时将自动检测",
+        description="嵌入向量维度，使用 MRL 截断以平衡性能与存储",
     )
     ollama_embedding_base_url: Optional[AnyUrl] = Field(
         default=None,
