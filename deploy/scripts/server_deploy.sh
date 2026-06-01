@@ -1,139 +1,143 @@
-#!/bin/bash
-# 服务器端一键部署脚本
-# 使用方法：
-# 1. SSH 登录服务器: ssh root@45.15.185.52
-# 2. 下载并执行: curl -fsSL https://raw.githubusercontent.com/all666666all/AI-novel/main/deploy/scripts/server_deploy.sh | bash
+#!/usr/bin/env bash
+# One-command server deployment script.
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/all666666all/AI-novel/main/deploy/scripts/server_deploy.sh | bash
 
-set -e
+set -euo pipefail
 
-echo "========================================="
-echo "AI-Novel 服务器端一键部署脚本"
-echo "========================================="
+APP_NAME="AI-Novel"
+REPO_URL="${REPO_URL:-https://github.com/all666666all/AI-novel.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+INSTALL_DIR="${INSTALL_DIR:-/root/AI-novel}"
+APP_PORT="${APP_PORT:-80}"
 
-# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# 1. 检查系统
-echo ""
-echo -e "${BLUE}1. 检查系统环境...${NC}"
-if [ "$(id -u)" != "0" ]; then
-   echo -e "${RED}错误：此脚本需要 root 权限${NC}"
-   exit 1
-fi
+log_step() {
+    echo ""
+    echo -e "${BLUE}$1${NC}"
+}
 
-echo "系统信息："
-uname -a
-echo ""
+require_root() {
+    if [ "$(id -u)" != "0" ]; then
+        echo -e "${RED}Error: this script must be run as root.${NC}"
+        exit 1
+    fi
+}
 
-# 2. 安装必需软件
-echo -e "${BLUE}2. 安装必需软件...${NC}"
+install_package() {
+    local package_name="$1"
+    if ! dpkg -s "$package_name" >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y "$package_name"
+    fi
+}
 
-# 安装 Git
-if ! command -v git &> /dev/null; then
-    echo "安装 Git..."
-    apt-get update
-    apt-get install -y git
-fi
-echo -e "${GREEN}✓ Git 已安装${NC}"
+detect_compose() {
+    if docker compose version >/dev/null 2>&1; then
+        COMPOSE_CMD=(docker compose)
+    elif command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE_CMD=(docker-compose)
+    else
+        echo -e "${YELLOW}Docker Compose plugin is missing. Installing docker-compose-plugin...${NC}"
+        install_package docker-compose-plugin
+        if docker compose version >/dev/null 2>&1; then
+            COMPOSE_CMD=(docker compose)
+        else
+            echo -e "${RED}Error: Docker Compose is not available after installation.${NC}"
+            exit 1
+        fi
+    fi
+}
 
-# 安装 curl
-if ! command -v curl &> /dev/null; then
-    echo "安装 curl..."
-    apt-get install -y curl
-fi
-echo -e "${GREEN}✓ curl 已安装${NC}"
+ensure_dependencies() {
+    install_package git
+    install_package curl
+    install_package openssl
 
-# 安装 Docker
-if ! command -v docker &> /dev/null; then
-    echo "安装 Docker..."
-    curl -fsSL https://get.docker.com | bash
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "Installing Docker..."
+        curl -fsSL https://get.docker.com | bash
+    fi
+
     systemctl start docker
-    systemctl enable docker
-    echo -e "${GREEN}✓ Docker 已安装${NC}"
-else
-    echo -e "${GREEN}✓ Docker 已存在${NC}"
-fi
+    systemctl enable docker >/dev/null 2>&1 || true
+    detect_compose
+}
 
-# 检查 Docker Compose
-if ! docker compose version &> /dev/null; then
-    echo -e "${YELLOW}⚠ Docker Compose 插件未安装，尝试安装...${NC}"
-    apt-get update
-    apt-get install -y docker-compose-plugin
-fi
-echo -e "${GREEN}✓ Docker Compose 已就绪${NC}"
+sync_project() {
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        echo "Updating existing project at $INSTALL_DIR..."
+        git -C "$INSTALL_DIR" fetch origin "$REPO_BRANCH"
+        git -C "$INSTALL_DIR" checkout "$REPO_BRANCH"
+        git -C "$INSTALL_DIR" pull --ff-only origin "$REPO_BRANCH"
+    elif [ -e "$INSTALL_DIR" ]; then
+        echo -e "${RED}Error: $INSTALL_DIR exists but is not a Git repository.${NC}"
+        exit 1
+    else
+        echo "Cloning project into $INSTALL_DIR..."
+        git clone --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR"
+    fi
+}
 
-# 3. 克隆或更新项目
-echo ""
-echo -e "${BLUE}3. 获取项目代码...${NC}"
-cd /root
+create_env_file() {
+    cd "$INSTALL_DIR"
+    if [ -f ".env" ]; then
+        echo -e "${GREEN}.env already exists.${NC}"
+        return
+    fi
 
-if [ -d "AI-novel" ]; then
-    echo "项目目录已存在，更新代码..."
-    cd AI-novel
-    git fetch origin
-    git reset --hard origin/main
-    git pull origin main
-    echo -e "${GREEN}✓ 代码已更新到最新版本${NC}"
-else
-    echo "克隆项目..."
-    git clone https://github.com/all666666all/AI-novel.git
-    cd AI-novel
-    echo -e "${GREEN}✓ 项目已克隆${NC}"
-fi
+    echo "Creating .env with local-deployment defaults..."
+    local secret_key
+    local mysql_password
+    local mysql_root_password
+    secret_key="$(openssl rand -hex 32)"
+    mysql_password="AI-Novel-MySQL-$(openssl rand -hex 16)"
+    mysql_root_password="AI-Novel-Root-$(openssl rand -hex 16)"
 
-# 4. 配置环境变量
-echo ""
-echo -e "${BLUE}4. 配置环境变量...${NC}"
-
-if [ ! -f ".env" ]; then
-    echo "创建 .env 文件..."
-    
-    # 生成随机密钥
-    SECRET_KEY=$(openssl rand -hex 32)
-    
-    cat > .env << ENVEOF
-# 应用配置
-SECRET_KEY=${SECRET_KEY}
+    cat > .env <<ENVEOF
+# Application
+SECRET_KEY=${secret_key}
 ENVIRONMENT=production
 DEBUG=false
 LOGGING_LEVEL=INFO
-APP_PORT=80
+APP_PORT=${APP_PORT}
 
-# 数据库配置（使用 SQLite，无需额外配置）
+# Database: SQLite by default for simple local deployment.
 DB_PROVIDER=sqlite
 SQLITE_STORAGE_SOURCE=sqlite-data
 
-# MySQL 配置（如果需要切换到 MySQL，修改 DB_PROVIDER=mysql 并启用 profile）
+# MySQL settings are only used when DB_PROVIDER=mysql and the mysql compose profile is enabled.
 MYSQL_HOST=db
 MYSQL_PORT=3306
 MYSQL_USER=arboris
-MYSQL_PASSWORD=AI-Novel-MySQL-$(openssl rand -hex 16)
+MYSQL_PASSWORD=${mysql_password}
 MYSQL_DATABASE=arboris
-MYSQL_ROOT_PASSWORD=AI-Novel-Root-$(openssl rand -hex 16)
+MYSQL_ROOT_PASSWORD=${mysql_root_password}
 
-# 管理员账号
+# Admin account
 ADMIN_DEFAULT_USERNAME=admin
 ADMIN_DEFAULT_PASSWORD=Admin123456!
 ADMIN_DEFAULT_EMAIL=admin@ai-novel.com
 
-# OpenAI API（请手动配置）
+# Main LLM API. Replace these before using generation features.
 OPENAI_API_KEY=sk-placeholder-please-replace-with-real-key
 OPENAI_API_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL_NAME=gpt-4
+OPENAI_MODEL_NAME=gpt-4o-mini
 WRITER_CHAPTER_VERSION_COUNT=2
 
-# Embedding 配置
+# Embeddings: SiliconFlow OpenAI-compatible API.
 EMBEDDING_PROVIDER=openai
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-EMBEDDING_API_KEY=\${OPENAI_API_KEY}
-EMBEDDING_MODEL=text-embedding-3-large
-EMBEDDING_MODEL_VECTOR_SIZE=3072
+EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+EMBEDDING_API_KEY=sk-placeholder-please-replace-with-siliconflow-key
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B
+EMBEDDING_MODEL_VECTOR_SIZE=1024
 
-# 向量数据库配置
+# Vector store
 VECTOR_DB_URL=file:./storage/rag_vectors.db
 VECTOR_DB_AUTH_TOKEN=
 VECTOR_TOP_K_CHUNKS=5
@@ -141,11 +145,11 @@ VECTOR_TOP_K_SUMMARIES=3
 VECTOR_CHUNK_SIZE=480
 VECTOR_CHUNK_OVERLAP=120
 
-# 用户注册
+# Registration and optional OAuth
 ALLOW_USER_REGISTRATION=true
 ENABLE_LINUXDO_LOGIN=false
 
-# SMTP 配置（可选）
+# Optional SMTP
 SMTP_SERVER=smtp.example.com
 SMTP_PORT=465
 SMTP_USERNAME=no-reply@example.com
@@ -153,98 +157,80 @@ SMTP_PASSWORD=
 EMAIL_FROM=AI-Novel
 ENVEOF
 
-    echo -e "${GREEN}✓ .env 文件已创建${NC}"
-    echo -e "${YELLOW}⚠ 请编辑 .env 文件，配置你的 OPENAI_API_KEY${NC}"
-    echo -e "${YELLOW}   执行: nano /root/AI-novel/.env${NC}"
-else
-    echo -e "${GREEN}✓ .env 文件已存在${NC}"
-fi
+    echo -e "${GREEN}.env created.${NC}"
+    echo -e "${YELLOW}Edit $INSTALL_DIR/.env and set OPENAI_API_KEY plus EMBEDDING_API_KEY before production use.${NC}"
+}
 
-# 5. 部署 Docker 容器
-echo ""
-echo -e "${BLUE}5. 部署 Docker 容器...${NC}"
+deploy_containers() {
+    cd "$INSTALL_DIR/deploy"
+    echo "Stopping old containers..."
+    "${COMPOSE_CMD[@]}" down 2>/dev/null || true
 
-cd deploy
+    echo "Building Docker images..."
+    "${COMPOSE_CMD[@]}" build
 
-# 停止旧容器
-echo "停止旧容器..."
-docker compose down 2>/dev/null || true
+    echo "Starting containers..."
+    "${COMPOSE_CMD[@]}" up -d
+}
 
-# 构建镜像
-echo "构建 Docker 镜像（这可能需要几分钟）..."
-docker compose build --no-cache
+wait_for_health() {
+    local max_retries=30
+    local retry=0
+    local health_url="http://127.0.0.1:${APP_PORT}/api/health"
 
-# 启动容器
-echo "启动容器..."
-docker compose up -d
-
-echo -e "${GREEN}✓ 容器已启动${NC}"
-
-# 6. 等待服务启动
-echo ""
-echo -e "${BLUE}6. 等待服务启动...${NC}"
-sleep 20
-
-# 7. 健康检查
-echo ""
-echo -e "${BLUE}7. 健康检查...${NC}"
-
-MAX_RETRIES=30
-RETRY_COUNT=0
-HEALTH_OK=false
-
-while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if curl -f http://127.0.0.1:80/api/health > /dev/null 2>&1; then
-        echo -e "${GREEN}✓ 服务健康检查通过${NC}"
-        HEALTH_OK=true
-        break
-    else
-        RETRY_COUNT=$((RETRY_COUNT + 1))
-        echo "等待服务启动... ($RETRY_COUNT/$MAX_RETRIES)"
+    echo "Waiting for service health at $health_url..."
+    sleep 10
+    while [ "$retry" -lt "$max_retries" ]; do
+        if curl -fsS "$health_url" >/dev/null 2>&1; then
+            echo -e "${GREEN}Health check passed.${NC}"
+            return
+        fi
+        retry=$((retry + 1))
+        echo "Waiting for service startup... ($retry/$max_retries)"
         sleep 2
-    fi
-done
+    done
 
-if [ "$HEALTH_OK" = false ]; then
-    echo -e "${RED}✗ 服务健康检查失败${NC}"
-    echo ""
-    echo "查看日志："
-    docker compose logs --tail=50 app
-    echo ""
-    echo "可能的原因："
-    echo "1. 端口 80 被占用"
-    echo "2. 数据库配置错误"
-    echo "3. 依赖安装失败"
-    echo ""
-    echo "请检查日志并重新运行脚本"
+    echo -e "${RED}Health check failed.${NC}"
+    echo "Recent app logs:"
+    cd "$INSTALL_DIR/deploy"
+    "${COMPOSE_CMD[@]}" logs --tail=80 app || true
     exit 1
-fi
+}
 
-# 8. 显示部署信息
-echo ""
+print_summary() {
+    local public_ip
+    public_ip="$(curl -fsS https://ifconfig.me 2>/dev/null || echo "SERVER_IP")"
+
+    echo ""
+    echo "========================================="
+    echo -e "${GREEN}${APP_NAME} deployment finished.${NC}"
+    echo "========================================="
+    echo "Frontend: http://${public_ip}:${APP_PORT}"
+    echo "Local API docs: http://127.0.0.1:${APP_PORT}/api/docs"
+    echo ""
+    echo "Admin account:"
+    echo "  Username: admin"
+    echo "  Password: Admin123456!"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Edit API keys: nano $INSTALL_DIR/.env"
+    echo "  2. Restart services: cd $INSTALL_DIR/deploy && ${COMPOSE_CMD[*]} restart"
+    echo "  3. View logs: cd $INSTALL_DIR/deploy && ${COMPOSE_CMD[*]} logs -f app"
+}
+
 echo "========================================="
-echo -e "${GREEN}部署成功！${NC}"
+echo "${APP_NAME} server deployment"
 echo "========================================="
-echo ""
-echo "访问信息："
-echo "  前端地址: http://$(curl -s ifconfig.me)"
-echo "  本地访问: http://localhost"
-echo "  API 文档: http://localhost/api/docs"
-echo ""
-echo "管理员账号："
-echo "  用户名: admin"
-echo "  密码: Admin123456!"
-echo ""
-echo -e "${YELLOW}重要提示：${NC}"
-echo "1. 请立即修改管理员密码"
-echo "2. 配置 OPENAI_API_KEY（如果还没有）："
-echo "   nano /root/AI-novel/.env"
-echo "   然后重启服务: cd /root/AI-novel/deploy && docker compose restart"
-echo ""
-echo "常用命令："
-echo "  查看日志: cd /root/AI-novel/deploy && docker compose logs -f app"
-echo "  重启服务: cd /root/AI-novel/deploy && docker compose restart"
-echo "  停止服务: cd /root/AI-novel/deploy && docker compose down"
-echo ""
-echo "如需帮助，请查看: /root/AI-novel/DEPLOYMENT_GUIDE_FULL.md"
-echo ""
+
+require_root
+log_step "1. Installing prerequisites..."
+ensure_dependencies
+log_step "2. Syncing project..."
+sync_project
+log_step "3. Preparing environment..."
+create_env_file
+log_step "4. Deploying Docker containers..."
+deploy_containers
+log_step "5. Running health check..."
+wait_for_health
+print_summary

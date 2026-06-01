@@ -19,7 +19,7 @@ services:
       MYSQL_HOST: ${MYSQL_HOST:-db}
       MYSQL_PORT: ${MYSQL_PORT:-3306}
       MYSQL_USER: ${MYSQL_USER:-arboris}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请设置数据库密码}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-arboris}
 
       ADMIN_DEFAULT_USERNAME: ${ADMIN_DEFAULT_USERNAME:-admin}
@@ -32,10 +32,10 @@ services:
       WRITER_CHAPTER_VERSION_COUNT: ${WRITER_CHAPTER_VERSION_COUNT:-2}
 
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
-      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.openai.com/v1}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-large}
-      EMBEDDING_MODEL_VECTOR_SIZE: ${EMBEDDING_MODEL_VECTOR_SIZE:-3072}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
+      EMBEDDING_MODEL_VECTOR_SIZE: ${EMBEDDING_MODEL_VECTOR_SIZE:-1024}
       OLLAMA_EMBEDDING_BASE_URL: ${OLLAMA_EMBEDDING_BASE_URL:-http://localhost:11434}
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text:latest}
 
@@ -101,10 +101,71 @@ services:
       - --collation-server=utf8mb4_unicode_ci
       - --max_connections=1000
 
+  # Redis — Celery broker + 缓存（通过 profile worker 启用）
+  redis:
+    image: redis:7-alpine
+    container_name: arboris-redis
+    profiles:
+      - worker
+    restart: unless-stopped
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - redis-data:/data
+
+  # Celery worker — 异步任务执行（通过 profile worker 启用）
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: arboris-app:local
+    container_name: arboris-worker
+    profiles:
+      - worker
+    entrypoint: ["celery", "-A", "app.config.celery_config.app", "worker", "--loglevel=info"]
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      SECRET_KEY: ${SECRET_KEY:?请设置SECRET_KEY}
+      DB_PROVIDER: ${DB_PROVIDER:-sqlite}
+      SQLITE_DB_PATH: ${SQLITE_DB_PATH:-/app/storage/arboris.db}
+      MYSQL_HOST: ${MYSQL_HOST:-db}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-arboris}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-arboris}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL_NAME: ${OPENAI_MODEL_NAME:-gpt-3.5-turbo}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
+      EMBEDDING_MODEL_VECTOR_SIZE: ${EMBEDDING_MODEL_VECTOR_SIZE:-1024}
+      VECTOR_DB_URL: ${VECTOR_DB_URL:-file:./storage/rag_vectors.db}
+      VECTOR_DB_AUTH_TOKEN: ${VECTOR_DB_AUTH_TOKEN:-}
+    restart: unless-stopped
+    volumes:
+      - ${SQLITE_STORAGE_SOURCE:-sqlite-data}:/app/storage
+    networks:
+      - app-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+
 volumes:
   mysql-data:
     driver: local
   sqlite-data:
+    driver: local
+  redis-data:
     driver: local
 
 networks:
