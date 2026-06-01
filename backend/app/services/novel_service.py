@@ -100,6 +100,7 @@ from ..schemas.novel import (
     Chapter as ChapterSchema,
     ChapterGenerationStatus,
     ChapterOutline as ChapterOutlineSchema,
+    ChapterVersion as ChapterVersionSchema,
     NovelProject as NovelProjectSchema,
     NovelProjectSummary,
     NovelSectionResponse,
@@ -441,24 +442,33 @@ class NovelService:
         return chapter
 
     async def replace_chapter_versions(self, chapter: Chapter, contents: List[str], metadata: Optional[List[Dict]] = None) -> List[ChapterVersion]:
-        await self.session.execute(delete(ChapterVersion).where(ChapterVersion.chapter_id == chapter.id))
-        versions: List[ChapterVersion] = []
+        # 先插入新版本，成功后再删除旧版本，避免先删后插的中间状态导致数据丢失
+        new_versions: List[ChapterVersion] = []
         for index, content in enumerate(contents):
             extra = metadata[index] if metadata and index < len(metadata) else None
             text_content = _normalize_version_content(content, extra)
             version = ChapterVersion(
                 chapter_id=chapter.id,
                 content=text_content,
-                metadata=extra,  # ✅ 落盘 metadata
+                metadata=extra,
                 version_label=f"v{index+1}",
             )
             self.session.add(version)
-            versions.append(version)
+            new_versions.append(version)
+        await self.session.flush()
+        # 删除未被新版本覆盖的旧版本（WHERE clause 排除刚插入的 id）
+        new_ids = [v.id for v in new_versions]
+        await self.session.execute(
+            delete(ChapterVersion).where(
+                ChapterVersion.chapter_id == chapter.id,
+                ChapterVersion.id.notin_(new_ids),
+            )
+        )
         chapter.status = ChapterGenerationStatus.WAITING_FOR_CONFIRM.value
         await self.session.commit()
         await self.session.refresh(chapter)
         await self._touch_project(chapter.project_id)
-        return versions
+        return new_versions
 
     async def select_chapter_version(self, chapter: Chapter, version_index: int) -> ChapterVersion:
         stmt = select(ChapterVersion).where(ChapterVersion.chapter_id == chapter.id).order_by(ChapterVersion.created_at)
@@ -715,7 +725,7 @@ class NovelService:
         summary = outline.summary if outline else ""
         real_summary = chapter.real_summary if chapter else None
         content = None
-        versions: Optional[List[str]] = None
+        versions: Optional[List[ChapterVersionSchema]] = None
         evaluation_text: Optional[str] = None
         status_value = ChapterGenerationStatus.NOT_GENERATED.value
         word_count = 0
@@ -730,7 +740,13 @@ class NovelService:
                     content = chapter.selected_version.content
                 if chapter.versions:
                     versions = [
-                        v.content
+                        ChapterVersionSchema(
+                            id=v.id,
+                            content=v.content,
+                            style=v.version_label,
+                            metadata=v.metadata,
+                            is_selected=bool(chapter.selected_version_id and v.id == chapter.selected_version_id),
+                        )
                         for v in sorted(chapter.versions, key=lambda item: item.created_at)
                     ]
                 if chapter.evaluations:

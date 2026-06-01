@@ -11,6 +11,7 @@
 """
 from typing import Optional, Dict, Any, List
 import json
+import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +19,8 @@ from .constitution_service import ConstitutionService
 from .writer_persona_service import WriterPersonaService
 from .llm_service import LLMService
 from .prompt_service import PromptService
+
+logger = logging.getLogger(__name__)
 
 
 class SixDimensionReviewService:
@@ -78,23 +81,57 @@ class SixDimensionReviewService:
         prompt = prompt.replace("{{world_setting}}", world_setting or "（无世界设定）")
         
         # 调用 LLM 进行审查
-        response = await self.llm_service.generate(
-            prompt=prompt,
-            system_prompt="你是一位资深的小说编辑，负责对章节进行全面的六维度审查。请以 JSON 格式输出审查结果。"
-        )
-        
+        try:
+            response = await self.llm_service.generate(
+                prompt=prompt,
+                system_prompt="你是一位资深的小说编辑，负责对章节进行全面的六维度审查。请以 JSON 格式输出审查结果。"
+            )
+        except Exception:
+            logger.warning("六维度审查 LLM 调用失败，返回无法审查状态")
+            return self._create_unavailable_result("LLM 服务不可用，无法完成审查")
+
         # 解析结果
+        review_data = None
         try:
             content = response or ""
             json_start = content.find("{")
             json_end = content.rfind("}") + 1
             if json_start >= 0 and json_end > json_start:
-                result = json.loads(content[json_start:json_end])
-                return result
+                review_data = json.loads(content[json_start:json_end])
         except json.JSONDecodeError:
             pass
-        
-        return self._create_default_result("审查完成，但结果解析失败")
+
+        if review_data is None or not isinstance(review_data, dict):
+            return self._create_unavailable_result("AI 返回格式无法解析，请重试")
+
+        # 验证每个维度的分数，对缺失或异常维度使用不可用标记
+        if "dimensions" not in review_data:
+            review_data["dimensions"] = {}
+        expected_dims = [
+            "constitution_compliance",
+            "internal_consistency",
+            "cross_chapter_consistency",
+            "plan_compliance",
+            "style_compliance",
+            "conflict_detection",
+        ]
+        for dim in expected_dims:
+            if dim not in review_data["dimensions"]:
+                review_data["dimensions"][dim] = {"score": None, "issues": [], "status": "unavailable"}
+            elif not isinstance(review_data["dimensions"][dim], dict):
+                review_data["dimensions"][dim] = {"score": None, "issues": [], "status": "unavailable"}
+            elif "score" not in review_data["dimensions"][dim]:
+                review_data["dimensions"][dim]["score"] = None
+                review_data["dimensions"][dim]["status"] = "unavailable"
+
+        review_data.setdefault("overall_score", None)
+        review_data.setdefault("critical_issues_count", 0)
+        review_data.setdefault("warning_issues_count", 0)
+        review_data.setdefault("info_issues_count", 0)
+        review_data.setdefault("summary", "审查完成（部分维度可能不可用）")
+        review_data.setdefault("priority_fixes", [])
+        review_data.setdefault("recommendations", [])
+        return review_data
 
     async def quick_review(
         self,
@@ -143,23 +180,27 @@ class SixDimensionReviewService:
         return results
 
     def _create_default_result(self, summary: str) -> Dict[str, Any]:
-        """创建默认结果"""
+        """创建全维度不可用的结果（提示词未配置或 LLM 不可达时使用）。"""
+        return self._create_unavailable_result(summary)
+
+    def _create_unavailable_result(self, summary: str) -> Dict[str, Any]:
+        """创建审查不可用结果，每个维度标记为 unavailable 而非伪造满分。"""
         return {
-            "overall_score": 80,
+            "overall_score": None,
             "dimensions": {
-                "constitution_compliance": {"score": 100, "issues": []},
-                "internal_consistency": {"score": 100, "issues": []},
-                "cross_chapter_consistency": {"score": 100, "issues": []},
-                "plan_compliance": {"score": 100, "issues": []},
-                "style_compliance": {"score": 100, "issues": []},
-                "conflict_detection": {"score": 100, "issues": []}
+                "constitution_compliance": {"score": None, "issues": [], "status": "unavailable"},
+                "internal_consistency": {"score": None, "issues": [], "status": "unavailable"},
+                "cross_chapter_consistency": {"score": None, "issues": [], "status": "unavailable"},
+                "plan_compliance": {"score": None, "issues": [], "status": "unavailable"},
+                "style_compliance": {"score": None, "issues": [], "status": "unavailable"},
+                "conflict_detection": {"score": None, "issues": [], "status": "unavailable"},
             },
             "critical_issues_count": 0,
             "warning_issues_count": 0,
             "info_issues_count": 0,
             "summary": summary,
             "priority_fixes": [],
-            "recommendations": []
+            "recommendations": [],
         }
 
     def aggregate_issues(self, review_result: Dict[str, Any]) -> List[Dict[str, Any]]:

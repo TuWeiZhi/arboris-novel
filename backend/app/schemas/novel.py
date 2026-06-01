@@ -54,12 +54,21 @@ class ChapterOutline(BaseModel):
     summary: str
 
 
+class ChapterVersion(BaseModel):
+    id: int
+    content: str
+    style: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    is_selected: bool = False
+
+
 class Chapter(ChapterOutline):
     real_summary: Optional[str] = None
     content: Optional[str] = None
-    versions: Optional[List[str]] = None
+    versions: Optional[List[ChapterVersion]] = None
     evaluation: Optional[str] = None
     generation_status: ChapterGenerationStatus = ChapterGenerationStatus.NOT_GENERATED
+    word_count: int = 0
 
 
 class Relationship(BaseModel):

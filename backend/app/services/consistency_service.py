@@ -18,7 +18,8 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from enum import Enum
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.project_memory import ProjectMemory
 from ..models.novel import NovelBlueprint, Chapter
@@ -148,16 +149,16 @@ GENERATE_FIX_PROMPT = """\
 class ConsistencyService:
     """
     一致性检查服务
-    
+
     负责检查章节内容与已有设定、状态的一致性。
     """
-    
+
     def __init__(
         self,
-        db: Session,
+        session: AsyncSession,
         llm_service: LLMService
     ):
-        self.db = db
+        self.session = session
         self.llm_service = llm_service
     
     async def check_consistency(
@@ -342,12 +343,12 @@ class ConsistencyService:
     ) -> Dict[str, str]:
         """获取检查所需的上下文"""
         context = {}
-        
+
         # 获取小说设定
-        blueprint = self.db.query(NovelBlueprint).filter(
-            NovelBlueprint.project_id == project_id
-        ).first()
-        
+        stmt = select(NovelBlueprint).where(NovelBlueprint.project_id == project_id)
+        result = await self.session.execute(stmt)
+        blueprint = result.scalar_one_or_none()
+
         if blueprint:
             setting_parts = []
             if blueprint.genre:
@@ -359,38 +360,40 @@ class ConsistencyService:
             if blueprint.full_synopsis:
                 setting_parts.append(f"故事概要: {blueprint.full_synopsis}")
             context["novel_setting"] = "\n".join(setting_parts)
-        
+
         # 获取项目记忆
-        memory = self.db.query(ProjectMemory).filter(
-            ProjectMemory.project_id == project_id
-        ).first()
-        
+        stmt = select(ProjectMemory).where(ProjectMemory.project_id == project_id)
+        result = await self.session.execute(stmt)
+        memory = result.scalar_one_or_none()
+
         if memory:
             context["global_summary"] = memory.global_summary or ""
             if memory.plot_arcs:
                 import json
                 context["plot_arcs"] = json.dumps(memory.plot_arcs, ensure_ascii=False, indent=2)
-        
+
         # 获取角色状态：统一通过共享工具读取（ProjectMemory.extra → 历史 CharacterState 回退）
         from ..utils.character_state import get_project_raw_state_text
-        raw_state_text = get_project_raw_state_text(self.db, project_id)
+        raw_state_text = await get_project_raw_state_text(self.session, project_id)
         if raw_state_text:
             context["character_state"] = raw_state_text
-        
+
         # 获取未回收伏笔
         if include_foreshadowing:
-            foreshadowings = self.db.query(Foreshadowing).filter(
+            stmt = select(Foreshadowing).where(
                 Foreshadowing.project_id == project_id,
                 Foreshadowing.status.in_(["planted", "developing"])
-            ).all()
-            
+            )
+            result = await self.session.execute(stmt)
+            foreshadowings = result.scalars().all()
+
             if foreshadowings:
                 foreshadowing_texts = [
                     f"- 第{f.chapter_number}章埋设: {f.content[:100]}..."
                     for f in foreshadowings[:10]
                 ]
                 context["foreshadowings"] = "\n".join(foreshadowing_texts)
-        
+
         return context
     
     def _parse_check_response(self, response: str) -> ConsistencyCheckResult:

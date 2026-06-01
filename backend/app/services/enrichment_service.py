@@ -13,8 +13,6 @@ import logging
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 
-from sqlalchemy.orm import Session
-
 from .llm_service import LLMService
 
 logger = logging.getLogger(__name__)
@@ -110,16 +108,11 @@ ENRICH_SCENE_PROMPT = """\
 class EnrichmentService:
     """
     章节扩写服务
-    
+
     负责检测字数不足并进行智能扩写。
     """
-    
-    def __init__(
-        self,
-        db: Session,
-        llm_service: LLMService
-    ):
-        self.db = db
+
+    def __init__(self, llm_service: LLMService):
         self.llm_service = llm_service
     
     async def check_and_enrich(

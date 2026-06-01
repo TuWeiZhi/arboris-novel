@@ -10,7 +10,6 @@
 # 基础服务
 from .llm_service import LLMService
 from .vector_store_service import VectorStoreService, RetrievedChunk, RetrievedSummary
-from .embedding_service import EmbeddingService
 
 # 融合服务（来自 AI_NovelGenerator 的设计理念）
 from .finalize_service import FinalizeService
@@ -18,14 +17,11 @@ from .consistency_service import ConsistencyService, ConsistencyCheckResult, Con
 from .knowledge_retrieval_service import KnowledgeRetrievalService, FilteredContext, RetrievedKnowledge
 from .enrichment_service import EnrichmentService, EnrichmentResult
 from .blueprint_service import BlueprintService
-from .vector_store_service_ext import VectorStoreServiceExt
 
 __all__ = [
     # 基础服务
     "LLMService",
     "VectorStoreService",
-    "VectorStoreServiceExt",
-    "EmbeddingService",
     "RetrievedChunk",
     "RetrievedSummary",
     # 融合服务

@@ -123,13 +123,69 @@ class WriterContextBuilder:
         # 6. 计算禁止角色列表（用于 Guardrails 检查）
         forbidden = set(all_names) - allowed
 
+        # 7. 构建角色心理档案（从 extra.dna_profile 中提取）
+        character_profiles = self._build_character_profiles(
+            writer_blueprint.get("characters", [])
+        )
+
         return {
             "writer_blueprint": writer_blueprint,
             "introduced_characters": sorted(list(introduced)),
             "planned_characters": sorted(list(planned)),
             "allowed_characters": sorted(list(allowed)),
             "forbidden_characters": sorted(list(forbidden)),
+            "character_profiles": character_profiles,
         }
+
+    def _build_character_profiles(self, characters: List[dict]) -> str:
+        """
+        从角色的 extra.dna_profile 中提取心理档案，格式化为 prompt 注入文本。
+        """
+        if not characters:
+            return ""
+
+        profiles = []
+        for char in characters:
+            name = char.get("name", "")
+            if not name:
+                continue
+            extra = char.get("extra") or {}
+            dna = extra.get("dna_profile") or {}
+            if not dna:
+                # 退化到基本字段
+                parts = [f"### {name}"]
+                if char.get("personality"):
+                    parts.append(f"- 性格：{char['personality']}")
+                if char.get("goals"):
+                    parts.append(f"- 目标：{char['goals']}")
+                if char.get("identity"):
+                    parts.append(f"- 身份：{char['identity']}")
+                if len(parts) > 1:
+                    profiles.append("\n".join(parts))
+                continue
+
+            parts = [f"### {name}"]
+            # 8 维心理档案
+            field_map = {
+                "childhood_trauma": "童年创伤",
+                "core_fear": "核心恐惧",
+                "inner_desire": "内心渴望",
+                "speech_habits": "语言习惯",
+                "body_language": "肢体语言",
+                "thinking_pattern": "思维模式",
+                "decision_style": "决策风格",
+                "hidden_secret": "隐藏秘密",
+            }
+            for key, label in field_map.items():
+                value = dna.get(key)
+                if value:
+                    parts.append(f"- {label}：{value}")
+            if len(parts) > 1:
+                profiles.append("\n".join(parts))
+
+        if not profiles:
+            return ""
+        return "## 角色心理档案\n\n" + "\n\n".join(profiles)
 
     def get_forbidden_names_pattern(self, forbidden_characters: List[str]) -> Optional[re.Pattern]:
         """

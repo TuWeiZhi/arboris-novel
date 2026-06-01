@@ -1,5 +1,12 @@
 # AIMETA P=伏笔API_伏笔管理和回收追踪|R=伏笔CRUD_回收追踪|NR=不含自动分析|E=route:GET_POST_/api/foreshadowing/*|X=http|A=伏笔CRUD_回收|D=fastapi,sqlalchemy|S=db|RD=./README.ai
-"""伏笔管理 API 接口"""
+"""伏笔管理 API 接口。
+
+响应格式约定：
+- 单资源 CRUD 使用 Pydantic response_model（如 ForeshadowingResponse）
+- 分页列表返回 {total, limit, offset, data} 字典
+- 操作类（删除/回收）返回 {status: "success", message: "..."} 字典
+该模式与项目中其他非核心路由（如 novels.py 操作接口）保持一致。
+"""
 import logging
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query

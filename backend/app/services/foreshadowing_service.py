@@ -145,7 +145,7 @@ class ForeshadowingService:
         query = select(Foreshadowing).where(
             and_(
                 Foreshadowing.project_id == project_id,
-                Foreshadowing.status == "open",
+                Foreshadowing.status.in_(["planted", "developing"]),
             )
         ).order_by(Foreshadowing.chapter_number)
         
@@ -220,7 +220,10 @@ class ForeshadowingService:
         # 统计
         total = len(foreshadowings)
         resolved_count = sum(1 for f in foreshadowings if f.status == "resolved")
-        unresolved_count = sum(1 for f in foreshadowings if f.status == "open")
+        unresolved_count = sum(
+            1 for f in foreshadowings
+            if f.status not in ("resolved", "abandoned")
+        )
         abandoned_count = sum(1 for f in foreshadowings if f.status == "abandoned")
         
         # 计算平均回收距离
@@ -268,7 +271,9 @@ class ForeshadowingService:
             recommendations.append("伏笔回收质量评分较低，建议改进回收方式")
         
         # 更新或创建分析记录
-        analysis = await self.session.get(ForeshadowingAnalysis, project_id)
+        stmt = select(ForeshadowingAnalysis).where(ForeshadowingAnalysis.project_id == project_id)
+        result = await self.session.execute(stmt)
+        analysis = result.scalar_one_or_none()
         if not analysis:
             analysis = ForeshadowingAnalysis(project_id=project_id)
             self.session.add(analysis)

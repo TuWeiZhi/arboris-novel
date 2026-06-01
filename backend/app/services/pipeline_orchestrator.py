@@ -1,6 +1,7 @@
-# AIMETA P=写作流水线编排_统一生成入口|R=上下文汇聚_生成_审查_优化|NR=不含API路由|E=PipelineOrchestrator|X=internal|A=编排器|D=fastapi,sqlalchemy|S=db,net|RD=./README.ai
+# AIMETA P=写作流水线编排_统一生成入口|R=编排_生成_审查_优化|NR=上下文收集已提取至ChapterContextAssembler|E=PipelineOrchestrator|X=internal|A=编排器|D=fastapi,sqlalchemy|S=db,net|RD=./README.ai
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -8,30 +9,28 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import settings
 from ..models.foreshadowing import Foreshadowing
-from ..models.memory_layer import CausalChain, CharacterState
-from ..models.novel import Chapter
-from ..models.project_memory import ProjectMemory
 from ..repositories.system_config_repository import SystemConfigRepository
 from ..services.ai_review_service import AIReviewService
-from ..services.chapter_context_service import ChapterContextService
+from ..services.chapter_context_assembler import (
+    AssembledChapterContext,
+    ChapterContextAssembler,
+    _normalize_blueprint,
+)
 from ..services.chapter_guardrails import ChapterGuardrails
 from ..services.consistency_service import ConsistencyService, ViolationSeverity
 from ..services.enhanced_writing_flow import EnhancedWritingFlow
 from ..services.enrichment_service import EnrichmentService
 from ..services.llm_service import LLMService
-from ..services.knowledge_retrieval_service import KnowledgeRetrievalService, FilteredContext
-from ..services.memory_layer_service import MemoryLayerService
 from ..services.novel_service import NovelService
 from ..services.preview_generation_service import PreviewGenerationService
 from ..services.prompt_service import PromptService
 from ..services.reader_simulator_service import ReaderSimulatorService, ReaderType
 from ..services.self_critique_service import CritiqueDimension, SelfCritiqueService
-from ..services.vector_store_service import VectorStoreService
 from ..services.writer_context_builder import WriterContextBuilder
 from ..utils.json_utils import remove_think_tags, unwrap_markdown_json
 
@@ -79,6 +78,7 @@ class PipelineOrchestrator:
         writing_notes: Optional[str] = None,
         flow_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """统一章节生成入口。"""
         config = await self._resolve_config(flow_config)
         project = await self.novel_service.ensure_project_owner(project_id, user_id)
 
@@ -93,172 +93,100 @@ class PipelineOrchestrator:
         await self.session.commit()
 
         outlines_map = {item.chapter_number: item for item in project.outlines}
-        history_context = await self._collect_history_context(
-            project_id=project_id,
-            chapter_number=chapter_number,
-            outlines_map=outlines_map,
-            chapters=project.chapters,
-            user_id=user_id,
-        )
-
         project_schema = await self.novel_service._serialize_project(project)
-        blueprint_dict = self._normalize_blueprint(project_schema.blueprint.model_dump())
+        blueprint_dict = _normalize_blueprint(project_schema.blueprint.model_dump())
 
         outline_title = outline.title or f"第{outline.chapter_number}章"
         outline_summary = outline.summary or "暂无摘要"
         writing_notes = writing_notes or "无额外写作指令"
 
-        all_characters = [c.get("name") for c in blueprint_dict.get("characters", []) if c.get("name")]
+        all_characters = [
+            c.get("name") for c in blueprint_dict.get("characters", []) if c.get("name")
+        ]
 
-        chapter_mission = await self._generate_chapter_mission(
-            blueprint_dict=blueprint_dict,
-            previous_summary=history_context["previous_summary"],
-            previous_tail=history_context["previous_tail"],
-            outline_title=outline_title,
-            outline_summary=outline_summary,
-            writing_notes=writing_notes,
-            introduced_characters=[],
-            all_characters=all_characters,
-            user_id=user_id,
-        )
-
-        allowed_new_characters = chapter_mission.get("allowed_new_characters", []) if chapter_mission else []
-
-        visibility_context = self.context_builder.build_visibility_context(
+        # 先构建可视化上下文（需要导演脚本的 allowed_new_characters，后补）
+        pilot_visibility = self.context_builder.build_visibility_context(
             blueprint=blueprint_dict,
-            completed_summaries=history_context["completed_summaries"],
-            previous_tail=history_context["previous_tail"],
+            completed_summaries=[],
+            previous_tail="",
             outline_title=outline_title,
             outline_summary=outline_summary,
             writing_notes=writing_notes,
-            allowed_new_characters=allowed_new_characters,
+            allowed_new_characters=[],
         )
 
-        writer_blueprint = visibility_context["writer_blueprint"]
-        forbidden_characters = visibility_context["forbidden_characters"]
-        introduced_characters = visibility_context["introduced_characters"]
+        # ---- 一站式上下文收集 ----
+        assembler = ChapterContextAssembler(self.session, self.llm_service, self.prompt_service)
+        ctx = await assembler.assemble(
+            project_id=project_id,
+            chapter_number=chapter_number,
+            user_id=user_id,
+            writing_notes=writing_notes,
+            outlines_map=outlines_map,
+            chapters=project.chapters,
+            blueprint_dict=blueprint_dict,
+            project_schema=project_schema,
+            outline_title=outline_title,
+            outline_summary=outline_summary,
+            config=config,
+            visibility_context=pilot_visibility,
+            chapter_mission_inputs={
+                "introduced_characters": [],
+                "all_characters": all_characters,
+            },
+        )
 
         logger.info(
             "Pipeline context: project=%s chapter=%s introduced=%d allowed_new=%d forbidden=%d",
-            project_id,
-            chapter_number,
-            len(introduced_characters),
-            len(allowed_new_characters),
-            len(forbidden_characters),
+            project_id, chapter_number,
+            len(ctx.introduced_characters),
+            len(ctx.allowed_new_characters),
+            len(ctx.forbidden_characters),
         )
 
-        enhanced_flow = None
-        enhanced_context = None
-        if config.enable_constitution or config.enable_persona or config.enable_foreshadowing or config.enable_faction:
-            enhanced_flow = EnhancedWritingFlow(self.session, self.llm_service, self.prompt_service)
-            enhanced_context = await enhanced_flow.prepare_writing_context(
-                project_id=project_id,
-                chapter_number=chapter_number,
-                chapter_outline=outline_summary,
-            )
-
-        memory_context = None
-        if config.enable_memory:
-            memory_context = await self._get_memory_context(
-                project_id=project_id,
-                chapter_number=chapter_number,
-                involved_characters=introduced_characters,
-            )
-
-        project_memory_text = await self._get_project_memory_text(project_id)
-
-        # 始终收集结构化记忆（角色状态/伏笔/因果链）
-        structured_memory = await self._get_structured_memory(
-            project_id=project_id,
-            chapter_number=chapter_number,
-            involved_characters=introduced_characters,
-        )
-
-        rag_context = None
-        knowledge_context = None
-        rag_stats = None
-        if config.enable_rag:
-            if config.rag_mode == "two_stage":
-                knowledge_context, rag_stats = await self._get_two_stage_rag_context(
-                    project_id=project_id,
-                    chapter_number=chapter_number,
-                    writing_notes=writing_notes,
-                    pov_character=self._resolve_pov_character(chapter_mission),
-                    user_id=user_id,
-                )
-            else:
-                rag_context = await self._get_rag_context(
-                    project_id=project_id,
-                    outline_title=outline_title,
-                    outline_summary=outline_summary,
-                    writing_notes=writing_notes,
-                    user_id=user_id,
-                )
-                rag_stats = {
-                    "mode": "simple",
-                    "chunks": len(rag_context.get("chunks", [])) if rag_context else 0,
-                    "summaries": len(rag_context.get("summaries", [])) if rag_context else 0,
-                }
-
+        # ---- 获取写作提示词 ----
         writer_prompt = await self.prompt_service.get_prompt("writing_v2")
         if not writer_prompt:
             writer_prompt = await self.prompt_service.get_prompt("writing")
         if not writer_prompt:
             raise HTTPException(status_code=500, detail="缺少写作提示词，请联系管理员配置")
 
-        prompt_sections = self._build_prompt_sections(
-            writer_blueprint=writer_blueprint,
-            previous_summary=history_context["previous_summary"],
-            previous_tail=history_context["previous_tail"],
-            chapter_mission=chapter_mission,
-            rag_context=rag_context,
-            knowledge_context=knowledge_context,
-            outline_title=outline_title,
-            outline_summary=outline_summary,
-            writing_notes=writing_notes,
-            forbidden_characters=forbidden_characters,
-            project_memory_text=project_memory_text,
-            memory_context=memory_context,
-            structured_memory=structured_memory,
-        )
+        logger.debug("Pipeline prompt length: %s chars", len(ctx.prompt_input))
 
-        if enhanced_flow and enhanced_context:
-            prompt_sections = enhanced_flow.build_enhanced_prompt_sections(prompt_sections, enhanced_context)
+        # ---- 多版本并发生成 ----
+        _gen_sem = asyncio.Semaphore(min(config.version_count, 3))
 
-        prompt_input = "\n\n".join(f"{title}\n{content}" for title, content in prompt_sections if content)
-        logger.debug("Pipeline prompt length: %s chars", len(prompt_input))
-
-        version_count = config.version_count
-        version_style_hints = self._resolve_style_hints(enhanced_context, version_count)
-
-        versions: List[Dict[str, Any]] = []
-        for idx in range(version_count):
-            style_hint = version_style_hints[idx] if idx < len(version_style_hints) else None
-            versions.append(
-                await self._generate_single_version(
+        async def _gen_one(idx: int) -> Dict[str, Any]:
+            style_hint = ctx.version_style_hints[idx] if idx < len(ctx.version_style_hints) else None
+            async with _gen_sem:
+                return await self._generate_single_version(
                     index=idx,
-                    prompt_input=prompt_input,
+                    prompt_input=ctx.prompt_input,
                     writer_prompt=writer_prompt,
                     style_hint=style_hint,
                     project_id=project_id,
                     chapter_number=chapter_number,
                     outline_title=outline_title,
                     outline_summary=outline_summary,
-                    chapter_mission=chapter_mission,
-                    forbidden_characters=forbidden_characters,
-                    allowed_new_characters=allowed_new_characters,
+                    chapter_mission=ctx.chapter_mission,
+                    forbidden_characters=ctx.forbidden_characters,
+                    allowed_new_characters=ctx.allowed_new_characters,
                     user_id=user_id,
-                    writer_blueprint=writer_blueprint,
-                    memory_context=memory_context,
-                    enhanced_context=enhanced_context,
+                    writer_blueprint=ctx.writer_blueprint,
+                    memory_context=ctx.memory_context,
+                    enhanced_context=ctx.enhanced_context,
                     config=config,
                 )
-            )
 
+        versions: List[Dict[str, Any]] = await asyncio.gather(
+            *(_gen_one(i) for i in range(config.version_count))
+        )
+        # Remove None entries for robustness (shouldn't happen in normal flow)
+        versions = [v for v in versions if v is not None]
+
+        # ---- AI 评审 ----
         best_version_index, ai_review_result = await self._run_ai_review(
-            versions=versions,
-            chapter_mission=chapter_mission,
-            user_id=user_id,
+            versions=versions, chapter_mission=ctx.chapter_mission, user_id=user_id,
         )
 
         review_summaries: Dict[str, Any] = {}
@@ -270,46 +198,41 @@ class PipelineOrchestrator:
         else:
             best_version_index = 0
 
+        # ---- 后处理流水线 ----
         if versions:
             best_version = versions[best_version_index]
             best_content = best_version["content"]
 
-            if enhanced_flow and config.enable_six_dimension:
-                review_result = await enhanced_flow.post_generation_review(
+            if ctx.enhanced_context and config.enable_six_dimension:
+                enhanced_flow = EnhancedWritingFlow(self.session, self.llm_service, self.prompt_service)
+                review_summaries["enhanced_review"] = await enhanced_flow.post_generation_review(
                     project_id=project_id,
                     chapter_number=chapter_number,
                     chapter_title=outline_title,
                     chapter_content=best_content,
-                    chapter_plan=json.dumps(chapter_mission, ensure_ascii=False) if chapter_mission else None,
-                    previous_summary=history_context["previous_summary"],
+                    chapter_plan=json.dumps(ctx.chapter_mission, ensure_ascii=False) if ctx.chapter_mission else None,
+                    previous_summary=ctx.history["previous_summary"],
                 )
-                review_summaries["enhanced_review"] = review_result
 
             if config.enable_self_critique:
                 best_content, critique_summary = await self._run_self_critique(
-                    best_content,
-                    user_id=user_id,
+                    best_content, user_id=user_id,
                     context={
-                        "character_profiles": json.dumps(writer_blueprint.get("characters", []), ensure_ascii=False),
-                        "previous_summary": history_context["previous_summary"],
+                        "character_profiles": json.dumps(ctx.writer_blueprint.get("characters", []), ensure_ascii=False),
+                        "previous_summary": ctx.history["previous_summary"],
                     },
                 )
                 review_summaries["self_critique"] = critique_summary
 
             if config.enable_reader_sim:
-                reader_feedback = await self._run_reader_simulation(
-                    best_content,
-                    chapter_number=chapter_number,
-                    previous_summary=history_context["previous_summary"],
-                    user_id=user_id,
+                review_summaries["reader_simulator"] = await self._run_reader_simulation(
+                    best_content, chapter_number=chapter_number,
+                    previous_summary=ctx.history["previous_summary"], user_id=user_id,
                 )
-                review_summaries["reader_simulator"] = reader_feedback
 
             if config.enable_consistency:
                 best_content, consistency_report = await self._run_consistency_check(
-                    project_id=project_id,
-                    chapter_text=best_content,
-                    user_id=user_id,
+                    project_id=project_id, chapter_text=best_content, user_id=user_id,
                 )
                 review_summaries["consistency"] = consistency_report
 
@@ -318,29 +241,40 @@ class PipelineOrchestrator:
                 review_summaries["optimizer"] = optimizer_report
 
             if config.enable_enrichment:
-                best_content, enrichment_report = await self._run_enrichment(
-                    best_content,
-                    user_id=user_id,
-                )
+                best_content, enrichment_report = await self._run_enrichment(best_content, user_id=user_id)
                 if enrichment_report:
                     review_summaries["enrichment"] = enrichment_report
 
             best_version["content"] = best_content
             best_version.setdefault("metadata", {})["review_summaries"] = review_summaries
 
+        # 伏笔一致性后置检查
+        if versions and config.enable_foreshadowing:
+            best_content = versions[best_version_index].get("content", "")
+            foreshadowing_check = await self._check_foreshadowing_consistency(
+                project_id=project_id, chapter_number=chapter_number, chapter_content=best_content,
+            )
+            if foreshadowing_check:
+                review_summaries["foreshadowing_check"] = foreshadowing_check
+                if foreshadowing_check.get("unexpected_resolutions"):
+                    logger.warning(
+                        "伏笔一致性警告: 章节 %s 意外回收了 %d 个伏笔",
+                        chapter_number, len(foreshadowing_check["unexpected_resolutions"]),
+                    )
+
+        # ---- 持久化版本 ----
         contents = [v.get("content", "") for v in versions]
         metadata = [v.get("metadata") for v in versions]
         versions_models = await self.novel_service.replace_chapter_versions(chapter, contents, metadata)
 
         variants = []
         for idx, version_model in enumerate(versions_models):
-            variant = {
+            variants.append({
                 "index": idx,
                 "version_id": version_model.id,
                 "content": versions[idx].get("content", ""),
                 "metadata": versions[idx].get("metadata"),
-            }
-            variants.append(variant)
+            })
 
         return {
             "project_id": project_id,
@@ -350,9 +284,9 @@ class PipelineOrchestrator:
             "variants": variants,
             "review_summaries": review_summaries,
             "debug_metadata": {
-                "version_count": version_count,
+                "version_count": config.version_count,
                 "stages": self._build_stage_flags(config),
-                "retrieval_stats": rag_stats,
+                "retrieval_stats": ctx.rag_stats,
             },
         }
 
@@ -435,491 +369,7 @@ class PipelineOrchestrator:
 
         return int(settings.writer_chapter_versions)
 
-    async def _collect_history_context(
-        self,
-        *,
-        project_id: str,
-        chapter_number: int,
-        outlines_map: Dict[int, Any],
-        chapters: List[Chapter],
-        user_id: int,
-    ) -> Dict[str, Any]:
-        completed_summaries = []
-        completed_chapters = []
-        latest_prev_number = -1
-        previous_summary_text = ""
-        previous_tail_excerpt = ""
-
-        for existing in chapters:
-            if existing.chapter_number >= chapter_number:
-                continue
-            if existing.selected_version is None or not existing.selected_version.content:
-                continue
-            if not existing.real_summary:
-                summary = await self.llm_service.get_summary(
-                    existing.selected_version.content,
-                    temperature=0.15,
-                    user_id=user_id,
-                    timeout=180.0,
-                )
-                existing.real_summary = remove_think_tags(summary)
-                await self.session.commit()
-
-            completed_chapters.append(
-                {
-                    "chapter_number": existing.chapter_number,
-                    "title": outlines_map.get(existing.chapter_number).title
-                    if outlines_map.get(existing.chapter_number)
-                    else f"第{existing.chapter_number}章",
-                    "summary": existing.real_summary,
-                }
-            )
-            completed_summaries.append(existing.real_summary or "")
-
-            if existing.chapter_number > latest_prev_number:
-                latest_prev_number = existing.chapter_number
-                previous_summary_text = existing.real_summary or ""
-                previous_tail_excerpt = self._extract_tail_excerpt(existing.selected_version.content)
-
-        return {
-            "completed_chapters": completed_chapters,
-            "completed_summaries": completed_summaries,
-            "previous_summary": previous_summary_text or "暂无（这是第一章）",
-            "previous_tail": previous_tail_excerpt or "暂无（这是第一章）",
-        }
-
-    @staticmethod
-    def _extract_tail_excerpt(text: Optional[str], limit: int = 1500) -> str:
-        if not text:
-            return ""
-        stripped = text.strip()
-        if len(stripped) <= limit:
-            return stripped
-        return stripped[-limit:]
-
-    @staticmethod
-    def _normalize_blueprint(blueprint_dict: Dict[str, Any]) -> Dict[str, Any]:
-        if "relationships" in blueprint_dict and blueprint_dict["relationships"]:
-            for relation in blueprint_dict["relationships"]:
-                if "character_from" in relation:
-                    relation["from"] = relation.pop("character_from")
-                if "character_to" in relation:
-                    relation["to"] = relation.pop("character_to")
-        return blueprint_dict
-
-    async def _generate_chapter_mission(
-        self,
-        *,
-        blueprint_dict: Dict[str, Any],
-        previous_summary: str,
-        previous_tail: str,
-        outline_title: str,
-        outline_summary: str,
-        writing_notes: str,
-        introduced_characters: List[str],
-        all_characters: List[str],
-        user_id: int,
-    ) -> Optional[dict]:
-        plan_prompt = await self.prompt_service.get_prompt("chapter_plan")
-        if not plan_prompt:
-            logger.warning("未配置 chapter_plan 提示词，跳过导演脚本生成")
-            return None
-
-        plan_input = f"""
-[上一章摘要]
-{previous_summary}
-
-[上一章结尾]
-{previous_tail}
-
-[当前章节大纲]
-标题：{outline_title}
-摘要：{outline_summary}
-
-[已登场角色]
-{json.dumps(introduced_characters, ensure_ascii=False) if introduced_characters else "暂无"}
-
-[全部角色]
-{json.dumps(all_characters, ensure_ascii=False)}
-
-[写作指令]
-{writing_notes}
-"""
-
-        try:
-            response = await self.llm_service.get_llm_response(
-                system_prompt=plan_prompt,
-                conversation_history=[{"role": "user", "content": plan_input}],
-                temperature=0.3,
-                user_id=user_id,
-                timeout=120.0,
-            )
-            cleaned = remove_think_tags(response)
-            normalized = unwrap_markdown_json(cleaned)
-            mission = json.loads(normalized)
-            logger.info("章节导演脚本生成完成: macro_beat=%s", mission.get("macro_beat"))
-            return mission
-        except Exception as exc:
-            logger.warning("生成章节导演脚本失败，将使用默认模式: %s", exc)
-            return None
-
-    async def _get_rag_context(
-        self,
-        *,
-        project_id: str,
-        outline_title: str,
-        outline_summary: str,
-        writing_notes: str,
-        user_id: int,
-    ) -> Dict[str, Any]:
-        if not settings.vector_store_enabled:
-            return {"chunks": [], "summaries": []}
-
-        try:
-            vector_store = VectorStoreService()
-        except RuntimeError as exc:
-            logger.warning("向量库初始化失败，跳过 RAG: %s", exc)
-            return {"chunks": [], "summaries": []}
-
-        query_parts = [outline_title, outline_summary]
-        if writing_notes:
-            query_parts.append(writing_notes)
-        rag_query = "\n".join(part for part in query_parts if part)
-
-        context_service = ChapterContextService(llm_service=self.llm_service, vector_store=vector_store)
-        rag_context = await context_service.retrieve_for_generation(
-            project_id=project_id,
-            query_text=rag_query or outline_title or outline_summary,
-            user_id=user_id,
-        )
-        return {
-            "chunks": rag_context.chunk_texts() if rag_context.chunks else [],
-            "summaries": rag_context.summary_lines() if rag_context.summaries else [],
-        }
-
-    async def _get_two_stage_rag_context(
-        self,
-        *,
-        project_id: str,
-        chapter_number: int,
-        writing_notes: str,
-        pov_character: Optional[str],
-        user_id: int,
-    ) -> Tuple[Optional[str], Dict[str, Any]]:
-        if not settings.vector_store_enabled:
-            return None, {"mode": "two_stage", "enabled": False}
-
-        try:
-            vector_store = VectorStoreService()
-        except RuntimeError as exc:
-            logger.warning("向量库初始化失败，跳过两层 RAG: %s", exc)
-            return None, {"mode": "two_stage", "enabled": False, "error": str(exc)}
-
-        sync_session = getattr(self.session, "sync_session", self.session)
-        retrieval_service = KnowledgeRetrievalService(sync_session, self.llm_service, vector_store)
-        filtered = await retrieval_service.retrieve_and_filter(
-            project_id=project_id,
-            chapter_number=chapter_number,
-            user_id=user_id,
-            pov_character=pov_character,
-            user_guidance=writing_notes,
-            top_k=settings.vector_top_k_chunks,
-        )
-        context_text = self._format_filtered_context(filtered)
-        stats = filtered.stats or {}
-        stats["mode"] = "two_stage"
-        return context_text, stats
-
-    async def _get_project_memory_text(self, project_id: str) -> Optional[str]:
-        result = await self.session.execute(
-            select(ProjectMemory).where(ProjectMemory.project_id == project_id)
-        )
-        memory = result.scalars().first()
-        if not memory:
-            return None
-
-        parts = []
-        if memory.global_summary:
-            parts.append(f"### 全局摘要\n{memory.global_summary}")
-        if memory.plot_arcs:
-            parts.append("### 剧情线追踪\n" + json.dumps(memory.plot_arcs, ensure_ascii=False, indent=2))
-        if not parts:
-            return None
-        return "\n\n".join(parts)
-
-    async def _get_memory_context(
-        self,
-        *,
-        project_id: str,
-        chapter_number: int,
-        involved_characters: List[str],
-    ) -> str:
-        memory_layer = MemoryLayerService(self.session, self.llm_service, self.prompt_service)
-        return await memory_layer.get_memory_context(project_id, chapter_number, involved_characters)
-
-    async def _get_structured_memory(
-        self,
-        *,
-        project_id: str,
-        chapter_number: int,
-        involved_characters: List[str],
-    ) -> Optional[str]:
-        """收集结构化记忆：角色状态 + 伏笔 + 因果链，始终调用。"""
-        sections: List[str] = []
-
-        # 1. 角色当前状态：优先 ProjectMemory.extra.raw_state_text（finalize 写入），
-        #    回退到 CharacterState 表（MemoryLayerService 写入）
-        raw_state = await self._get_raw_state_text(project_id)
-        if raw_state:
-            sections.append("## 角色当前状态\n\n" + raw_state)
-        else:
-            character_states = await self._query_latest_character_states(
-                project_id, chapter_number - 1
-            )
-            if character_states:
-                lines = []
-                for state in character_states:
-                    if involved_characters and state.character_name not in involved_characters:
-                        continue
-                    parts = [f"### {state.character_name}"]
-                    if state.location:
-                        parts.append(f"- 位置：{state.location}")
-                    if state.emotion:
-                        parts.append(f"- 情绪：{state.emotion}（强度 {state.emotion_intensity}/10）")
-                    if state.health_status and state.health_status != "healthy":
-                        parts.append(f"- 健康：{state.health_status}")
-                    if state.known_secrets:
-                        parts.append(f"- 已知秘密：{', '.join(state.known_secrets[:3])}")
-                    if state.current_goals:
-                        parts.append(f"- 当前目标：{', '.join(state.current_goals[:3])}")
-                    if len(parts) > 1:
-                        lines.append("\n".join(parts))
-                if lines:
-                    sections.append("## 角色当前状态\n\n" + "\n\n".join(lines))
-
-        # 2. 活跃伏笔（planted/developing/partial + 紧迫/即将到期/超期）
-        foreshadowings = await self._query_active_foreshadowings(project_id, chapter_number)
-        if foreshadowings:
-            lines = []
-            for fs in foreshadowings:
-                label = f"第{fs.chapter_number}章埋设"
-                if fs.target_reveal_chapter:
-                    label += f"，计划第{fs.target_reveal_chapter}章回收"
-                urgency_tag = ""
-                if fs.target_reveal_chapter:
-                    diff = fs.target_reveal_chapter - chapter_number
-                    if diff < 0:
-                        urgency_tag = " [已超期]"
-                    elif diff <= 3:
-                        urgency_tag = " [即将到期]"
-                lines.append(f"- {fs.content[:100]}（{label}）{urgency_tag}")
-            if lines:
-                sections.append("## 活跃伏笔\n\n" + "\n".join(lines))
-
-        # 3. 待解决因果链
-        causal_chains = await self._query_pending_causal_chains(project_id)
-        if causal_chains:
-            lines = []
-            for chain in causal_chains[:5]:
-                chars = ""
-                if chain.involved_characters:
-                    chars = f" [涉及：{', '.join(chain.involved_characters[:3])}]"
-                lines.append(f"- 第{chain.cause_chapter}章：{chain.cause_description} → 待兑现：{chain.effect_description}{chars}")
-            if lines:
-                sections.append("## 待解决因果链\n\n" + "\n".join(lines))
-
-        if not sections:
-            return None
-        return "\n\n".join(sections)
-
-    async def _get_raw_state_text(self, project_id: str) -> Optional[str]:
-        """读取 ProjectMemory.extra.raw_state_text（finalize 写入的单一真源）。"""
-        result = await self.session.execute(
-            select(ProjectMemory).where(ProjectMemory.project_id == project_id)
-        )
-        memory = result.scalars().first()
-        if memory and memory.extra:
-            text = memory.extra.get("raw_state_text")
-            if text:
-                return text
-        return None
-
-    async def _query_latest_character_states(
-        self, project_id: str, chapter_number: int
-    ) -> list:
-        """查询各角色在指定章节的最新状态快照（按 max(chapter_number)，再按 max(id) 去重同章重复）。"""
-        max_chapter_subq = (
-            select(
-                CharacterState.character_name.label("character_name"),
-                func.max(CharacterState.chapter_number).label("max_chapter"),
-            )
-            .where(
-                and_(
-                    CharacterState.project_id == project_id,
-                    CharacterState.chapter_number <= chapter_number,
-                )
-            )
-            .group_by(CharacterState.character_name)
-            .subquery()
-        )
-
-        # 在最大章号内取最大 id，避免同章多行重复
-        max_id_subq = (
-            select(
-                CharacterState.character_name.label("character_name"),
-                CharacterState.chapter_number.label("chapter_number"),
-                func.max(CharacterState.id).label("max_id"),
-            )
-            .join(
-                max_chapter_subq,
-                and_(
-                    CharacterState.character_name == max_chapter_subq.c.character_name,
-                    CharacterState.chapter_number == max_chapter_subq.c.max_chapter,
-                ),
-            )
-            .where(CharacterState.project_id == project_id)
-            .group_by(CharacterState.character_name, CharacterState.chapter_number)
-            .subquery()
-        )
-
-        query = (
-            select(CharacterState)
-            .join(max_id_subq, CharacterState.id == max_id_subq.c.max_id)
-            .where(CharacterState.project_id == project_id)
-        )
-        result = await self.session.execute(query)
-        return list(result.scalars().all())
-
-    async def _query_active_foreshadowings(
-        self, project_id: str, chapter_number: int
-    ) -> list:
-        """查询活跃伏笔：紧迫/即将到期/超期的优先返回。"""
-        query = (
-            select(Foreshadowing)
-            .where(
-                and_(
-                    Foreshadowing.project_id == project_id,
-                    Foreshadowing.status.in_(["planted", "developing", "partial"]),
-                )
-            )
-            .order_by(Foreshadowing.chapter_number)
-        )
-        result = await self.session.execute(query)
-        all_active = list(result.scalars().all())
-
-        # 分组：overdue > due_soon > urgent > rest
-        overdue, due_soon, urgent, rest = [], [], [], []
-        for fs in all_active:
-            if fs.urgency and fs.urgency >= 8:
-                urgent.append(fs)
-            elif fs.target_reveal_chapter:
-                diff = fs.target_reveal_chapter - chapter_number
-                if diff < 0:
-                    overdue.append(fs)
-                elif diff <= 3:
-                    due_soon.append(fs)
-                else:
-                    rest.append(fs)
-            elif (chapter_number - fs.chapter_number) >= 20:
-                overdue.append(fs)
-            else:
-                rest.append(fs)
-
-        # 优先级排序，最多返回 10 条
-        return (overdue + due_soon + urgent + rest)[:10]
-
-    async def _query_pending_causal_chains(self, project_id: str) -> list:
-        """查询待解决的因果链。"""
-        result = await self.session.execute(
-            select(CausalChain)
-            .where(
-                and_(
-                    CausalChain.project_id == project_id,
-                    CausalChain.status == "pending",
-                )
-            )
-            .order_by(CausalChain.cause_chapter)
-        )
-        return list(result.scalars().all())
-
-    @staticmethod
-    def _build_prompt_sections(
-        *,
-        writer_blueprint: Dict[str, Any],
-        previous_summary: str,
-        previous_tail: str,
-        chapter_mission: Optional[dict],
-        rag_context: Optional[Dict[str, Any]],
-        knowledge_context: Optional[str],
-        outline_title: str,
-        outline_summary: str,
-        writing_notes: str,
-        forbidden_characters: List[str],
-        project_memory_text: Optional[str],
-        memory_context: Optional[str],
-        structured_memory: Optional[str] = None,
-    ) -> List[Tuple[str, str]]:
-        blueprint_text = json.dumps(writer_blueprint, ensure_ascii=False, indent=2)
-        mission_text = json.dumps(chapter_mission, ensure_ascii=False, indent=2) if chapter_mission else "无导演脚本"
-        forbidden_text = json.dumps(forbidden_characters, ensure_ascii=False) if forbidden_characters else "无"
-
-        sections: List[Tuple[str, str]] = [
-            ("[世界蓝图](JSON，已裁剪)", blueprint_text),
-        ]
-
-        if project_memory_text:
-            sections.append(("[项目长期记忆](摘要/剧情线)", project_memory_text))
-        if structured_memory:
-            sections.append(("[结构化记忆](角色状态/伏笔/因果链)", structured_memory))
-        if memory_context:
-            sections.append(("[记忆层上下文]", memory_context))
-
-        sections.extend(
-            [
-                ("[上一章摘要]", previous_summary or "暂无（这是第一章）"),
-                ("[上一章结尾]", previous_tail or "暂无（这是第一章）"),
-                ("[章节导演脚本](JSON)", mission_text),
-            ]
-        )
-
-        if knowledge_context:
-            sections.append(("[RAG精筛上下文](含POV裁剪)", knowledge_context))
-
-        if rag_context:
-            rag_chunks_text = "\n\n".join(rag_context.get("chunks", [])) or "未检索到章节片段"
-            rag_summaries_text = "\n".join(rag_context.get("summaries", [])) or "未检索到章节摘要"
-            sections.append(("[检索到的剧情上下文](Markdown)", rag_chunks_text))
-            sections.append(("[检索到的章节摘要](Markdown)", rag_summaries_text))
-
-        sections.extend(
-            [
-                ("[当前章节目标]", f"标题：{outline_title}\n摘要：{outline_summary}\n写作要求：{writing_notes}"),
-                ("[禁止角色](本章不允许提及)", forbidden_text),
-            ]
-        )
-
-        return sections
-
-    @staticmethod
-    def _resolve_style_hints(
-        enhanced_context: Optional[Dict[str, Any]],
-        version_count: int,
-    ) -> List[str]:
-        if enhanced_context and enhanced_context.get("version_style_hints"):
-            hints = enhanced_context["version_style_hints"]
-            if isinstance(hints, list) and hints:
-                return hints[:version_count]
-        return [
-            "情绪更细腻，节奏更慢，多写内心戏和感官描写",
-            "冲突更强，节奏更快，多写动作和对话",
-            "悬念更重，多埋伏笔，结尾钩子更强",
-        ][:version_count]
-
-    @staticmethod
-    def _resolve_pov_character(chapter_mission: Optional[dict]) -> Optional[str]:
-        if not chapter_mission:
-            return None
-        return chapter_mission.get("pov") or chapter_mission.get("pov_character")
+    # ── 上下文收集已提取至 ChapterContextAssembler ──
 
     async def _generate_single_version(
         self,
@@ -984,20 +434,51 @@ class PipelineOrchestrator:
             allowed_new_characters=allowed_new_characters,
             pov=chapter_mission.get("pov") if chapter_mission else None,
         )
-        guardrail_metadata = {"passed": guardrail_result.passed, "violations": []}
+        guardrail_metadata = {"passed": guardrail_result.passed, "violations": [], "retry_count": 0}
 
         if not guardrail_result.passed:
             guardrail_metadata["violations"] = [
                 {"type": v.type, "severity": v.severity, "description": v.description}
                 for v in guardrail_result.violations
             ]
-            violations_text = self.guardrails.format_violations_for_rewrite(guardrail_result)
-            content = await self._rewrite_with_guardrails(
-                original_text=content,
-                chapter_mission=chapter_mission,
-                violations_text=violations_text,
-                user_id=user_id,
-            )
+            # 自动返工机制：最多重试 3 次
+            max_retries = 3
+            for retry in range(max_retries):
+                violations_text = self.guardrails.format_violations_for_rewrite(guardrail_result)
+                content = await self._rewrite_with_guardrails(
+                    original_text=content,
+                    chapter_mission=chapter_mission,
+                    violations_text=violations_text,
+                    user_id=user_id,
+                )
+                # 重新检查
+                guardrail_result = self.guardrails.check(
+                    generated_text=content,
+                    forbidden_characters=forbidden_characters,
+                    allowed_new_characters=allowed_new_characters,
+                    pov=chapter_mission.get("pov") if chapter_mission else None,
+                )
+                if guardrail_result.passed:
+                    guardrail_metadata["passed"] = True
+                    guardrail_metadata["retry_count"] = retry + 1
+                    break
+                # 红线违规时额外记录
+                if guardrail_result.red_line_triggered:
+                    guardrail_metadata["red_line_triggered"] = True
+                    guardrail_metadata["violations"] = [
+                        {"type": v.type, "severity": v.severity, "description": v.description}
+                        for v in guardrail_result.violations
+                    ]
+            else:
+                # 3 次重试后仍未通过
+                guardrail_metadata["retry_count"] = max_retries
+                guardrail_metadata["auto_fix_failed"] = True
+                if guardrail_result.red_line_triggered:
+                    guardrail_metadata["red_line_triggered"] = True
+                guardrail_metadata["violations"] = [
+                    {"type": v.type, "severity": v.severity, "description": v.description}
+                    for v in guardrail_result.violations
+                ]
 
         parsed_json = None
         extracted_text = None
@@ -1149,12 +630,17 @@ class PipelineOrchestrator:
                 "suggestions": ai_review_result.refinement_suggestions if idx == ai_review_result.best_version_index else None,
             }
 
+        # LLM 发现的红线违规记录到元数据
+        llm_red_lines = ai_review_result.red_line_violations or []
+
         return ai_review_result.best_version_index, {
             "best_version_index": ai_review_result.best_version_index,
             "scores": ai_review_result.scores,
             "evaluation": ai_review_result.overall_evaluation,
             "flaws": ai_review_result.critical_flaws,
             "suggestions": ai_review_result.refinement_suggestions,
+            "anti_ai_score": ai_review_result.scores.get("anti_ai"),
+            "llm_red_line_violations": llm_red_lines,
         }
 
     async def _run_self_critique(
@@ -1208,8 +694,7 @@ class PipelineOrchestrator:
         chapter_text: str,
         user_id: int,
     ) -> Tuple[str, Dict[str, Any]]:
-        sync_session = getattr(self.session, "sync_session", self.session)
-        service = ConsistencyService(sync_session, self.llm_service)
+        service = ConsistencyService(self.session, self.llm_service)
         result = await service.check_consistency(project_id, chapter_text, user_id, include_foreshadowing=True)
         report = {
             "is_consistent": result.is_consistent,
@@ -1295,7 +780,7 @@ class PipelineOrchestrator:
         user_id: int,
         target_word_count: int = 3000,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
-        service = EnrichmentService(self.session, self.llm_service)
+        service = EnrichmentService(self.llm_service)
         result = await service.check_and_enrich(
             chapter_text=chapter_content,
             target_word_count=target_word_count,
@@ -1310,6 +795,103 @@ class PipelineOrchestrator:
             "enrichment_ratio": result.enrichment_ratio,
             "enrichment_type": result.enrichment_type,
         }
+
+    async def _check_foreshadowing_consistency(
+        self,
+        *,
+        project_id: str,
+        chapter_number: int,
+        chapter_content: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        伏笔一致性后置检查：
+        1. 检查是否有未到期伏笔被意外回收
+        2. 检查超期伏笔是否被推进
+        3. 生成伏笔台账报告
+        """
+        result = await self.session.execute(
+            select(Foreshadowing).where(
+                and_(
+                    Foreshadowing.project_id == project_id,
+                    Foreshadowing.status.in_(["planted", "developing", "partial"]),
+                )
+            )
+        )
+        active_foreshadowings = list(result.scalars().all())
+        if not active_foreshadowings:
+            return None
+
+        unexpected_resolutions = []
+        overdue_addressed = []
+        overdue_ignored = []
+
+        for fs in active_foreshadowings:
+            content_lower = chapter_content.lower()
+            # 简单关键词匹配检测伏笔是否在本章被提及
+            fs_keywords = fs.keywords or []
+            fs_content = (fs.content or "").lower()
+            mentioned = False
+            if fs_content and any(kw in content_lower for kw in fs_content[:20].split()):
+                mentioned = True
+            if fs_keywords and any(kw.lower() in content_lower for kw in fs_keywords if kw):
+                mentioned = True
+
+            if not mentioned:
+                continue
+
+            # 伏笔被提及
+            if fs.target_reveal_chapter and fs.target_reveal_chapter > chapter_number + 3:
+                # 未到期的伏笔被提及 — 可能是意外回收
+                unexpected_resolutions.append({
+                    "foreshadowing_id": fs.id,
+                    "content": (fs.content or "")[:80],
+                    "planted_chapter": fs.chapter_number,
+                    "target_reveal_chapter": fs.target_reveal_chapter,
+                })
+            elif fs.target_reveal_chapter and fs.target_reveal_chapter <= chapter_number:
+                # 超期伏笔被推进 — 正面信号
+                overdue_addressed.append({
+                    "foreshadowing_id": fs.id,
+                    "content": (fs.content or "")[:80],
+                    "overdue_by": chapter_number - fs.target_reveal_chapter,
+                })
+
+        # 检查超期但未被推进的伏笔
+        for fs in active_foreshadowings:
+            if fs.target_reveal_chapter and fs.target_reveal_chapter < chapter_number:
+                if fs.id not in [a["foreshadowing_id"] for a in overdue_addressed]:
+                    overdue_ignored.append({
+                        "foreshadowing_id": fs.id,
+                        "content": (fs.content or "")[:80],
+                        "overdue_by": chapter_number - fs.target_reveal_chapter,
+                    })
+
+        report = {
+            "total_active": len(active_foreshadowings),
+            "unexpected_resolutions": unexpected_resolutions,
+            "overdue_addressed": overdue_addressed,
+            "overdue_ignored": overdue_ignored[:5],  # 最多报告 5 个
+        }
+
+        # 伏笔台账统计
+        if active_foreshadowings:
+            total = len(active_foreshadowings)
+            overdue_count = sum(
+                1 for fs in active_foreshadowings
+                if fs.target_reveal_chapter and fs.target_reveal_chapter < chapter_number
+            )
+            due_soon_count = sum(
+                1 for fs in active_foreshadowings
+                if fs.target_reveal_chapter and 0 <= fs.target_reveal_chapter - chapter_number <= 5
+            )
+            report["foreshadowing_ledger"] = {
+                "active_count": total,
+                "overdue_count": overdue_count,
+                "due_soon_count": due_soon_count,
+                "health": "critical" if overdue_count > 5 else "warning" if overdue_count > 2 else "healthy",
+            }
+
+        return report if any([unexpected_resolutions, overdue_addressed, overdue_ignored]) else None
 
     @staticmethod
     def _build_stage_flags(config: PipelineConfig) -> Dict[str, bool]:
@@ -1328,27 +910,6 @@ class PipelineOrchestrator:
             "rag_mode": config.rag_mode == "two_stage",
         }
 
-    @staticmethod
-    def _format_filtered_context(filtered: FilteredContext) -> Optional[str]:
-        if not filtered:
-            return None
-
-        sections = []
-        if filtered.plot_fuel:
-            sections.append("## 情节燃料\n" + "\n".join(f"- {item}" for item in filtered.plot_fuel))
-        if filtered.character_info:
-            sections.append("## 人物维度\n" + "\n".join(f"- {item}" for item in filtered.character_info))
-        if filtered.world_fragments:
-            sections.append("## 世界碎片\n" + "\n".join(f"- {item}" for item in filtered.world_fragments))
-        if filtered.narrative_techniques:
-            sections.append("## 叙事技法\n" + "\n".join(f"- {item}" for item in filtered.narrative_techniques))
-        if filtered.warnings:
-            sections.append("## 冲突警告\n" + "\n".join(f"- {item}" for item in filtered.warnings))
-
-        if not sections:
-            return "（未检索到有效上下文）"
-
-        return "\n\n".join(sections)
 
 
 __all__ = ["PipelineOrchestrator", "PipelineConfig"]

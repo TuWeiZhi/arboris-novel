@@ -30,6 +30,7 @@ class ReviewResult:
     refinement_suggestions: str
     final_recommendation: str
     raw_response: Optional[str] = None
+    red_line_violations: Optional[List[str]] = None  # 红线违规（一票否决）
 
 
 class AIReviewService:
@@ -132,6 +133,30 @@ class AIReviewService:
 
         lines.append("[评审要求]")
         lines.append("请按照评审流程，对上述版本进行对比分析，输出 JSON 格式的评审结果。")
+        lines.append("")
+        lines.append("[额外评审维度]")
+        lines.append("除常规评审外，请额外评估以下两个维度：")
+        lines.append("")
+        lines.append("## 1. AI 味检测（anti_ai_score: 0-100，100=完全无 AI 味）")
+        lines.append("检查要点：")
+        lines.append("- 句式是否过于规整？人类写作的句子长短不一、节奏不规则，AI 倾向于句式均匀")
+        lines.append("- 情感表达是否标签化？'心中涌起一股暖流''五味杂陈'这类模板化表达是 AI 特征")
+        lines.append("- 叙事节奏是否单调？AI 倾向于匀速推进，人类写作有快慢交替、有留白")
+        lines.append("- 对话是否过于工整？真实对话有打断、有废话、有未说完的句子")
+        lines.append("- 是否存在结构性连接词？'首先/其次/综上所述'是 AI 最典型的特征")
+        lines.append("- 描写是否过于'干净'？人类写作会有无关细节、思维跳跃、偶尔的不完美")
+        lines.append("- 角色内心独白是否过于理性？真实的情绪是混乱的、矛盾的、非线性的")
+        lines.append("")
+        lines.append("## 2. 红线检查（red_line_violations: [] 或 ['违规1', '违规2'])")
+        lines.append("以下情况任一出现即为红线违规：")
+        lines.append("- 反派降智：反派突然变蠢、做出不合逻辑的决定来衬托主角")
+        lines.append("- 机械降神：危急关头突然出现未知力量/人物解围，无任何铺垫")
+        lines.append("- 主角双标：主角做某事被美化，别人做同样的事被批判")
+        lines.append("- 时间线错乱：事件时间顺序自相矛盾")
+        lines.append("- 战力崩坏：角色能力忽强忽弱，不符合已建立的设定")
+        lines.append("- 配角工具人：配角存在仅为服务主角，无独立动机和行为逻辑")
+        lines.append("- 无脑后宫：异性角色无理由地爱上主角")
+        lines.append("- 烂尾逻辑：结局与前文铺垫矛盾")
 
         return "\n".join(lines)
 
@@ -139,13 +164,24 @@ class AIReviewService:
         """解析评审响应"""
         try:
             data = json.loads(response)
+
+            # 提取 AI 味分数和红线违规（LLM 评审的额外维度）
+            anti_ai_score = data.get("anti_ai_score")
+            red_line_violations = data.get("red_line_violations", [])
+
+            # 将额外维度合并到 scores 中
+            scores = data.get("scores", {})
+            if anti_ai_score is not None:
+                scores["anti_ai"] = anti_ai_score
+
             return ReviewResult(
                 best_version_index=data.get("best_version_index", 0),
-                scores=data.get("scores", {}),
+                scores=scores,
                 overall_evaluation=data.get("overall_evaluation", ""),
                 critical_flaws=data.get("critical_flaws", []),
                 refinement_suggestions=data.get("refinement_suggestions", ""),
                 final_recommendation=data.get("final_recommendation", ""),
+                red_line_violations=red_line_violations if red_line_violations else None,
             )
         except json.JSONDecodeError:
             logger.warning("评审响应不是有效 JSON，使用默认结果")
