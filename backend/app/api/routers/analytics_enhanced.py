@@ -4,8 +4,10 @@
 集成多维情感分析、故事轨迹分析和创意指导系统
 """
 
+import json
 import logging
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -161,15 +163,16 @@ async def get_enhanced_emotion_curve(
     cache_key = f"emotion_curve_enhanced:{project_id}"
     
     if use_cache:
-        cached = await cache_service.get(cache_key)
-        if cached:
-            logger.info(f"从缓存返回项目 {project_id} 的增强情感曲线")
+        cached_raw = await cache_service.get(cache_key)
+        if cached_raw:
+            cached = json.loads(cached_raw)
+            logger.info("从缓存返回增强情感曲线: project=%s", project_id)
             return [MultidimensionalEmotionPoint(**point) for point in cached]
     
     # 获取所有已完成的章节
     stmt = select(Chapter).where(
         Chapter.project_id == project_id,
-        Chapter.status == "completed"
+        Chapter.status == "successful"
     ).order_by(Chapter.chapter_number)
     
     result = await session.execute(stmt)
@@ -201,7 +204,7 @@ async def get_enhanced_emotion_curve(
                 emotion_points.append(MultidimensionalEmotionPoint(
                     chapter_number=chapter.chapter_number,
                     chapter_id=str(chapter.id),
-                    title=version.title or f"第{chapter.chapter_number}章",
+                    title=f"第{chapter.chapter_number}章",
                     primary_emotion=analysis['primary_emotion'],
                     primary_intensity=analysis['primary_intensity'],
                     secondary_emotions=analysis['secondary_emotions'],
@@ -216,8 +219,8 @@ async def get_enhanced_emotion_curve(
     if emotion_points:
         await cache_service.set(
             cache_key,
-            [point.model_dump() for point in emotion_points],
-            expire=86400
+            json.dumps([point.model_dump() for point in emotion_points]),
+            ttl=86400,
         )
     
     return emotion_points
@@ -258,12 +261,12 @@ async def get_story_trajectory(
     # 尝试从缓存获取
     cache_service = CacheService()
     cache_key = f"story_trajectory:{project_id}"
-    
+
     if use_cache:
-        cached = await cache_service.get(cache_key)
-        if cached:
-            logger.info(f"从缓存返回项目 {project_id} 的故事轨迹分析")
-            return StoryTrajectoryResponse(**cached)
+        cached_raw = await cache_service.get(cache_key)
+        if cached_raw:
+            logger.info("从缓存返回故事轨迹: project=%s", project_id)
+            return StoryTrajectoryResponse(**json.loads(cached_raw))
     
     # 先获取情感点数据
     emotion_points_response = await get_enhanced_emotion_curve(
@@ -308,7 +311,7 @@ async def get_story_trajectory(
     )
     
     # 缓存结果（24小时）
-    await cache_service.set(cache_key, response.model_dump(), expire=86400)
+    await cache_service.set(cache_key, json.dumps(response.model_dump()), ttl=86400)
     
     return response
 
@@ -348,12 +351,12 @@ async def get_creative_guidance(
     # 尝试从缓存获取
     cache_service = CacheService()
     cache_key = f"creative_guidance:{project_id}"
-    
+
     if use_cache:
-        cached = await cache_service.get(cache_key)
-        if cached:
-            logger.info(f"从缓存返回项目 {project_id} 的创意指导")
-            return CreativeGuidanceResponse(**cached)
+        cached_raw = await cache_service.get(cache_key)
+        if cached_raw:
+            logger.info("从缓存返回创意指导: project=%s", project_id)
+            return CreativeGuidanceResponse(**json.loads(cached_raw))
     
     # 获取情感点和轨迹分析
     emotion_points_response = await get_enhanced_emotion_curve(
@@ -411,7 +414,7 @@ async def get_creative_guidance(
     )
     
     # 缓存结果（12小时）
-    await cache_service.set(cache_key, response.model_dump(), expire=43200)
+    await cache_service.set(cache_key, json.dumps(response.model_dump()), ttl=43200)
     
     return response
 
