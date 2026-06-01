@@ -25,3 +25,5 @@ __pycache__/
 *.pyo
 *.pyd
 *.db
+参考资料/
+.ace-tool/
