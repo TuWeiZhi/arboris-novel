@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import JSON, BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, BigInteger, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -32,7 +32,7 @@ class Foreshadowing(Base):
     keywords: Mapped[Optional[list]] = mapped_column(JSON, default=list)
     
     # 伏笔状态
-    status: Mapped[str] = mapped_column(String(32), default="planted", index=True)  # planted, developing, revealed, abandoned, partial
+    status: Mapped[str] = mapped_column(String(32), default="planted", index=True)  # planted, developing, partial, resolved, abandoned
     resolved_chapter_id: Mapped[Optional[int]] = mapped_column(ForeignKey("chapters.id", ondelete="SET NULL"))
     resolved_chapter_number: Mapped[Optional[int]] = mapped_column(Integer)
     
@@ -67,6 +67,10 @@ class Foreshadowing(Base):
     )
     reminders: Mapped[list["ForeshadowingReminder"]] = relationship(
         back_populates="foreshadowing", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_foreshadowing_project_status", "project_id", "status"),
     )
 
 

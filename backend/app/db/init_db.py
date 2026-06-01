@@ -1,9 +1,11 @@
-# AIMETA P=数据库初始化_创建表和默认数据|R=创建表_初始化管理员|NR=不含业务逻辑|E=init_db|X=internal|A=初始化函数|D=sqlalchemy|S=db|RD=./README.ai
+# AIMETA P=数据库初始化_创建表和默认数据|R=Alembic迁移_初始化管理员|NR=不含业务逻辑|E=init_db|X=internal|A=初始化函数|D=sqlalchemy,alembic|S=db|RD=./README.ai
+import asyncio
 import logging
-
 from pathlib import Path
 
-from sqlalchemy import inspect, select, text
+from alembic import command
+from alembic.config import Config as AlembicConfig
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -11,23 +13,32 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from ..core.config import settings
 from ..core.security import hash_password
 from ..models import Prompt, SystemConfig, User
-from .base import Base
 from .system_config_defaults import SYSTEM_CONFIG_DEFAULTS
-from .session import AsyncSessionLocal, engine
+from .session import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
 
+_ALEMBIC_CFG_PATH = Path(__file__).resolve().parents[2] / "alembic.ini"
+
 
 async def init_db() -> None:
-    """初始化数据库结构并确保默认管理员存在。"""
+    """初始化数据库结构并确保默认管理员存在。
 
+    表结构通过 Alembic 迁移管理，
+    数据初始化（管理员、系统配置、提示词）在迁移后完成。
+    """
     await _ensure_database_exists()
 
-    # ---- 第一步：创建所有表结构 ----
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("数据库表结构已初始化")
-    await _ensure_schema_updates()
+    # Auto-fix Alembic encoding on Windows GBK locale
+    _patch_alembic_encoding()
+
+    # ---- 第一步：运行 Alembic 迁移创建/升级表结构 ----
+    # Alembic 内部使用 asyncio.run() 创建事件循环，在 FastAPI lifespan
+    # 中已有运行中的事件循环，必须在线程中执行避免冲突。
+    alembic_cfg = AlembicConfig(str(_ALEMBIC_CFG_PATH))
+    alembic_cfg.set_main_option("script_location", str(_ALEMBIC_CFG_PATH.parent / "alembic"))
+    await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+    logger.info("数据库表结构已通过 Alembic 迁移初始化")
 
     # ---- 第二步：确保管理员账号至少存在一个 ----
     async with AsyncSessionLocal() as session:
@@ -40,7 +51,6 @@ async def init_db() -> None:
                 hashed_password=hash_password(settings.admin_default_password),
                 is_admin=True,
             )
-
             session.add(admin_user)
             try:
                 await session.commit()
@@ -68,8 +78,21 @@ async def init_db() -> None:
             )
 
         await _ensure_default_prompts(session)
-
         await session.commit()
+
+
+def _patch_alembic_encoding() -> None:
+    """Windows GBK locale 会导致 alembic 读取 alembic.ini 时乱码，补丁为 UTF-8。"""
+    try:
+        import alembic.util.compat as compat_module
+        _orig_read = compat_module.read_config_parser
+
+        def _utf8_read(file_config, files):
+            return file_config.read(files, encoding="utf-8")
+
+        compat_module.read_config_parser = _utf8_read
+    except Exception:
+        pass
 
 
 async def _ensure_database_exists() -> None:
@@ -77,7 +100,6 @@ async def _ensure_database_exists() -> None:
     url = make_url(settings.sqlalchemy_database_uri)
 
     if url.get_backend_name() == "sqlite":
-        # SQLite 采用文件数据库，确保父目录存在即可，无需额外建库语句
         db_path = Path(url.database or "").expanduser()
         if not db_path.is_absolute():
             project_root = Path(__file__).resolve().parents[2]
@@ -98,7 +120,6 @@ async def _ensure_database_exists() -> None:
         database=None,
         query=url.query,
     )
-
     admin_engine = create_async_engine(
         admin_url.render_as_string(hide_password=False),
         isolation_level="AUTOCOMMIT",
@@ -106,17 +127,6 @@ async def _ensure_database_exists() -> None:
     async with admin_engine.begin() as conn:
         await conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{database}`"))
     await admin_engine.dispose()
-
-
-async def _ensure_schema_updates() -> None:
-    """补齐历史版本缺失的列，避免旧库在新版本报错。"""
-    async with engine.begin() as conn:
-        def _upgrade(sync_conn):
-            inspector = inspect(sync_conn)
-            columns = {col["name"] for col in inspector.get_columns("chapter_outlines")}
-            if "metadata" not in columns:
-                sync_conn.execute(text("ALTER TABLE chapter_outlines ADD COLUMN metadata JSON"))
-        await conn.run_sync(_upgrade)
 
 
 async def _ensure_default_prompts(session: AsyncSession) -> None:
