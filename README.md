@@ -69,50 +69,95 @@
 
 ```bash
 # 1. 复制配置文件
-cp .env.example .env
+cp deploy/.env.example .env
 
-# 2. 编辑 .env 中的必填项：
+# 2. 编辑根目录 .env 中的必填项：
 #    - SECRET_KEY: 随机字符串，用于 JWT 等
 #    - OPENAI_API_KEY: 大模型 API Key
+#    - EMBEDDING_API_KEY: 硅基流动 Embedding API Key
 #    - ADMIN_DEFAULT_PASSWORD: 管理员密码（勿用默认值）
 
 # 3. 启动（默认 SQLite，无需单独安装数据库）
-docker compose up -d
+docker compose -f deploy/docker-compose.yml up -d --build
 
 # 启动后在浏览器访问 http://localhost:<端口>
+```
+
+也可以在配置好根目录 `.env` 后使用脚本部署：
+
+```bash
+bash deploy/scripts/deploy_docker.sh
 ```
 
 ### 方式二：使用 MySQL（Compose 内 MySQL）
 
 ```bash
-# .env 中设置 DB_PROVIDER=mysql，然后执行：
-DB_PROVIDER=mysql docker compose --profile mysql up -d
+# .env 中设置 DB_PROVIDER=mysql、MYSQL_PASSWORD、MYSQL_ROOT_PASSWORD，然后执行：
+docker compose -f deploy/docker-compose.yml --profile mysql up -d --build
 ```
 
 ### 方式三：使用自有 MySQL
 
 ```bash
-# 在 .env 中配置数据库地址、用户名、密码后执行：
-DB_PROVIDER=mysql docker compose up -d
+# 在 .env 中配置 DB_PROVIDER=mysql 以及外部数据库地址、用户名、密码后执行：
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+### 可选：启动异步任务 Worker
+
+情感分析、异步任务执行和 Redis 缓存需要额外启用 `worker` profile：
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile worker up -d --build
+
+# 如果同时使用 Compose 内 MySQL：
+docker compose -f deploy/docker-compose.yml --profile mysql --profile worker up -d --build
 ```
 
 ---
 
 ## 环境变量说明
 
-常用配置如下（完整项见 `.env.example`）：
+常用配置如下（完整项见 `deploy/.env.example`，运行时请复制到根目录 `.env`）：
 
 | 配置项 | 必填吗 | 说明 |
 |--------|--------|------|
 | `SECRET_KEY` | ✅ | JWT 加密密钥，需自行随机生成并妥善保管 |
 | `OPENAI_API_KEY` | ✅ | 你的 LLM API Key（OpenAI 或兼容的） |
 | `OPENAI_API_BASE_URL` | ❌ | API 地址，默认是 OpenAI 官方的 |
-| `OPENAI_MODEL_NAME` | ❌ | 模型名称，默认 `gpt-3.5-turbo` |
+| `OPENAI_MODEL_NAME` | ❌ | 主要生成模型名称，建议显式填写 |
+| `EMBEDDING_API_KEY` | ✅ | 硅基流动 Embedding API Key；若与主 LLM 同 Key 才可复用 |
+| `EMBEDDING_BASE_URL` | ❌ | 默认 `https://api.siliconflow.cn/v1` |
+| `EMBEDDING_MODEL` | ❌ | 默认 `Qwen/Qwen3-Embedding-8B` |
+| `EMBEDDING_MODEL_VECTOR_SIZE` | ❌ | 默认 `1024`，需与嵌入模型维度一致 |
+| `VECTOR_DB_URL` | ❌ | RAG 向量库地址，默认本地 libSQL 文件 `file:./storage/rag_vectors.db` |
+| `DB_PROVIDER` | ❌ | `sqlite` 或 `mysql`，默认 `sqlite` |
+| `MYSQL_*` | 使用 MySQL 时必填 | MySQL 主机、端口、用户、密码、数据库名 |
 | `ADMIN_DEFAULT_PASSWORD` | ❌ | 管理员初始密码，部署后务必修改 |
 | `ALLOW_USER_REGISTRATION` | ❌ | 是否开放注册，默认 `false` |
 | `SMTP_SERVER` / `SMTP_USERNAME` | 开放注册时必填 | 邮件服务，用于发送验证码 |
 
-> **数据存储：** 默认 SQLite，数据在 Docker 卷中。需映射到本地时，在 `.env` 中设置 `SQLITE_STORAGE_SOURCE=./storage`。
+> **数据存储：** 默认 SQLite，数据在 Docker 卷中。需映射到宿主机目录时，在 `.env` 中设置 `SQLITE_STORAGE_SOURCE=./storage`。
+
+> **嵌入模型：** 当前默认使用硅基流动 OpenAI-compatible Embeddings API 的 `Qwen/Qwen3-Embedding-8B`，不是 Ollama 本地模型。只有在你明确设置 `EMBEDDING_PROVIDER=ollama` 时才需要部署 Ollama。
+
+---
+
+## 中间件与部署选型
+
+当前代码状态下，推荐的部署组合如下：
+
+| 组件 | 默认选型 | 是否必需 | 部署方式 |
+|------|----------|----------|----------|
+| 应用服务 | 单容器内 Nginx + FastAPI/Uvicorn + 前端静态文件 | ✅ | `deploy/Dockerfile` 构建，Compose 中 `app` 服务启动 |
+| 关系数据库 | SQLite | ✅ | 默认使用 Docker volume `sqlite-data`，也可用 `SQLITE_STORAGE_SOURCE=./storage` 映射到宿主机 |
+| MySQL | MySQL 8.0 | 可选 | 内置服务通过 `--profile mysql` 启用；外部 MySQL 只需配置 `MYSQL_HOST` 等变量 |
+| 数据库迁移 | Alembic | ✅ | 应用启动时自动执行；也可运行 `bash deploy/scripts/run_migrations.sh` |
+| 向量数据库 | libSQL 本地文件 | ✅（用于 RAG） | 默认 `file:./storage/rag_vectors.db`，随 `/app/storage` 持久化；也可改为远程 libSQL/Turso 地址 |
+| 嵌入模型 | 硅基流动 `Qwen/Qwen3-Embedding-8B` | ✅（用于 RAG） | 远程 OpenAI-compatible API，配置 `EMBEDDING_API_KEY` 即可 |
+| Redis | Redis 7 Alpine | 可选 | 通过 `--profile worker` 启用，供 Celery broker/result backend 和缓存使用 |
+| Celery Worker | Celery 5 | 可选 | 通过 `--profile worker` 启用，执行异步任务 |
+| SMTP | 任意 SMTP 服务 | 可选 | 开放注册或邮件验证码时配置 |
 
 ---
 
@@ -187,10 +232,12 @@ A: 可以尝试：
 ## 技术栈
 
 - **后端：** Python + FastAPI
-- **数据库：** SQLite（默认）或 MySQL + libsql
+- **数据库：** SQLite（默认）或 MySQL 8.0，Alembic 管理迁移
+- **向量检索：** libSQL 本地文件或远程 libSQL/Turso
 - **前端：** Vue + TailwindCSS
-- **部署：** Docker + Docker Compose
-- **AI：** OpenAI API 或兼容接口
+- **异步任务：** Celery + Redis（可选 profile）
+- **部署：** Docker + Docker Compose profiles
+- **AI：** OpenAI-compatible LLM；默认嵌入为硅基流动 `Qwen/Qwen3-Embedding-8B`
 
 ---
 

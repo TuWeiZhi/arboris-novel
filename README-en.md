@@ -69,50 +69,95 @@ The goal is a **writing partner that remembers your world, understands your char
 
 ```bash
 # 1. Copy config
-cp .env.example .env
+cp deploy/.env.example .env
 
-# 2. Edit required fields in .env:
+# 2. Edit required fields in the repo-root .env:
 #    - SECRET_KEY: random string for JWT etc.
 #    - OPENAI_API_KEY: your LLM API key
+#    - EMBEDDING_API_KEY: SiliconFlow embedding API key
 #    - ADMIN_DEFAULT_PASSWORD: admin password (do not leave default)
 
 # 3. Start (default SQLite, no separate DB install)
-docker compose up -d
+docker compose -f deploy/docker-compose.yml up -d --build
 
 # Then open http://localhost:<port> in your browser
+```
+
+You can also deploy with the helper script after preparing the repo-root `.env`:
+
+```bash
+bash deploy/scripts/deploy_docker.sh
 ```
 
 ### Option 2: MySQL via Compose
 
 ```bash
-# Set DB_PROVIDER=mysql in .env, then:
-DB_PROVIDER=mysql docker compose --profile mysql up -d
+# Set DB_PROVIDER=mysql, MYSQL_PASSWORD, and MYSQL_ROOT_PASSWORD in .env, then:
+docker compose -f deploy/docker-compose.yml --profile mysql up -d --build
 ```
 
 ### Option 3: Your own MySQL
 
 ```bash
-# Configure DB host, user, password in .env, then:
-DB_PROVIDER=mysql docker compose up -d
+# Configure DB_PROVIDER=mysql plus external DB host/user/password in .env, then:
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+### Optional: start async workers
+
+Emotion analysis, async jobs, and Redis-backed cache require the `worker` profile:
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile worker up -d --build
+
+# If you also use the Compose-managed MySQL service:
+docker compose -f deploy/docker-compose.yml --profile mysql --profile worker up -d --build
 ```
 
 ---
 
 ## Environment variables
 
-Common options (full list in `.env.example`):
+Common options (full list in `deploy/.env.example`; copy it to the repo-root `.env`):
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SECRET_KEY` | ✅ | JWT secret; generate randomly and keep safe |
 | `OPENAI_API_KEY` | ✅ | Your LLM API key (OpenAI or compatible) |
 | `OPENAI_API_BASE_URL` | ❌ | API base URL; default is OpenAI |
-| `OPENAI_MODEL_NAME` | ❌ | Model name; default `gpt-3.5-turbo` |
+| `OPENAI_MODEL_NAME` | ❌ | Main generation model; set explicitly for your provider |
+| `EMBEDDING_API_KEY` | ✅ | SiliconFlow embedding API key; reuse `OPENAI_API_KEY` only if both services share a key |
+| `EMBEDDING_BASE_URL` | ❌ | Default `https://api.siliconflow.cn/v1` |
+| `EMBEDDING_MODEL` | ❌ | Default `Qwen/Qwen3-Embedding-8B` |
+| `EMBEDDING_MODEL_VECTOR_SIZE` | ❌ | Default `1024`; must match the embedding model dimension |
+| `VECTOR_DB_URL` | ❌ | RAG vector store URL; default local libSQL file `file:./storage/rag_vectors.db` |
+| `DB_PROVIDER` | ❌ | `sqlite` or `mysql`; default `sqlite` |
+| `MYSQL_*` | If using MySQL | MySQL host, port, user, password, and database |
 | `ADMIN_DEFAULT_PASSWORD` | ❌ | Initial admin password; change after deploy |
 | `ALLOW_USER_REGISTRATION` | ❌ | Allow sign-up; default `false` |
 | `SMTP_SERVER` / `SMTP_USERNAME` | If registration on | Mail config for verification emails |
 
 > **Storage:** Default is SQLite in a Docker volume. To use a local path, set `SQLITE_STORAGE_SOURCE=./storage` in `.env`.
+
+> **Embeddings:** The default embedding backend is SiliconFlow's OpenAI-compatible API with `Qwen/Qwen3-Embedding-8B`, not a local Ollama model. Deploy Ollama only if you explicitly set `EMBEDDING_PROVIDER=ollama`.
+
+---
+
+## Middleware and Deployment Choices
+
+Recommended choices for the current codebase:
+
+| Component | Default choice | Required | Deployment |
+|-----------|----------------|----------|------------|
+| App service | Single container with Nginx + FastAPI/Uvicorn + frontend static files | ✅ | Built from `deploy/Dockerfile`; started as the Compose `app` service |
+| Relational DB | SQLite | ✅ | Default Docker volume `sqlite-data`; set `SQLITE_STORAGE_SOURCE=./storage` to bind-mount a host directory |
+| MySQL | MySQL 8.0 | Optional | Enable the built-in service with `--profile mysql`, or point `MYSQL_HOST` etc. to an external MySQL |
+| DB migrations | Alembic | ✅ | Runs during app startup; can also be run with `bash deploy/scripts/run_migrations.sh` |
+| Vector store | Local libSQL file | ✅ for RAG | Default `file:./storage/rag_vectors.db`, persisted under `/app/storage`; can be changed to remote libSQL/Turso |
+| Embedding model | SiliconFlow `Qwen/Qwen3-Embedding-8B` | ✅ for RAG | Remote OpenAI-compatible API; set `EMBEDDING_API_KEY` |
+| Redis | Redis 7 Alpine | Optional | Enable with `--profile worker`; used for Celery broker/result backend and cache |
+| Celery worker | Celery 5 | Optional | Enable with `--profile worker`; runs async jobs |
+| SMTP | Any SMTP provider | Optional | Configure when sign-up/email verification is enabled |
 
 ---
 
@@ -169,11 +214,13 @@ A: Try: filling in character/location/faction settings; improving chapter outlin
 
 ## Tech stack
 
-- **Backend:** Python + FastAPI  
-- **Database:** SQLite (default) or MySQL + libsql  
-- **Frontend:** Vue + TailwindCSS  
-- **Deploy:** Docker + Docker Compose  
-- **AI:** OpenAI API or compatible
+- **Backend:** Python + FastAPI
+- **Database:** SQLite (default) or MySQL 8.0, with Alembic migrations
+- **Vector retrieval:** Local libSQL file or remote libSQL/Turso
+- **Frontend:** Vue + TailwindCSS
+- **Async jobs:** Celery + Redis (optional profile)
+- **Deploy:** Docker + Docker Compose profiles
+- **AI:** OpenAI-compatible LLM; default embeddings use SiliconFlow `Qwen/Qwen3-Embedding-8B`
 
 ---
 
