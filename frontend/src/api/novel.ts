@@ -156,6 +156,68 @@ export interface DeleteNovelsResponse {
   message: string
 }
 
+export interface CanonEntry {
+  id: number
+  project_id: string
+  category: string
+  title: string
+  content: string
+  aliases?: string[] | null
+  keywords?: string[] | null
+  tags?: string[] | null
+  relations?: Record<string, any> | null
+  status?: string | null
+  visibility?: string | null
+  source?: string | null
+  valid_from_chapter?: number | null
+  valid_until_chapter?: number | null
+  last_verified_chapter?: number | null
+  hard_rule?: boolean | null
+  extra?: Record<string, any> | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface CanonEntryPayload {
+  category: string
+  title: string
+  content: string
+  aliases?: string[] | null
+  keywords?: string[] | null
+  tags?: string[] | null
+  relations?: Record<string, any> | null
+  status?: string
+  visibility?: string
+  source?: string | null
+  valid_from_chapter?: number | null
+  valid_until_chapter?: number | null
+  last_verified_chapter?: number | null
+  hard_rule?: boolean
+  extra?: Record<string, any> | null
+}
+
+export interface CanonListParams {
+  category?: string
+  status?: string
+  chapter_number?: number | null
+  query?: string
+}
+
+export interface CanonListResponse {
+  project_id: string
+  entries: CanonEntry[]
+}
+
+export interface CanonEntryResponse {
+  project_id: string
+  entry: CanonEntry
+}
+
+export interface CanonDeleteResponse {
+  project_id: string
+  deleted_entry_id: number
+}
+
 // 内容型Section（对应后端NovelSectionType枚举）
 export type NovelSectionType = 'overview' | 'world_setting' | 'characters' | 'relationships' | 'chapter_outline' | 'chapters'
 
@@ -172,6 +234,7 @@ export interface NovelSectionResponse {
 
 // API 函数
 const NOVELS_BASE = `${API_BASE_URL}${API_PREFIX}/novels`
+const PROJECTS_BASE = `${API_BASE_URL}${API_PREFIX}/projects`
 const WRITER_PREFIX = '/api/writer'
 const WRITER_BASE = `${API_BASE_URL}${WRITER_PREFIX}/novels`
 
@@ -332,6 +395,42 @@ export class NovelAPI {
         chapter_number: chapterNumber,
         content: content
       })
+    })
+  }
+
+  static async listCanonEntries(projectId: string, params: CanonListParams = {}): Promise<CanonListResponse> {
+    const search = new URLSearchParams()
+    if (params.category) search.set('category', params.category)
+    if (params.status) search.set('status', params.status)
+    if (params.chapter_number !== undefined && params.chapter_number !== null) {
+      search.set('chapter_number', String(params.chapter_number))
+    }
+    if (params.query?.trim()) search.set('query', params.query.trim())
+    const query = search.toString()
+    return request(`${PROJECTS_BASE}/${projectId}/canon${query ? `?${query}` : ''}`)
+  }
+
+  static async createCanonEntry(projectId: string, payload: CanonEntryPayload): Promise<CanonEntryResponse> {
+    return request(`${PROJECTS_BASE}/${projectId}/canon`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    })
+  }
+
+  static async updateCanonEntry(
+    projectId: string,
+    entryId: number,
+    payload: CanonEntryPayload
+  ): Promise<CanonEntryResponse> {
+    return request(`${PROJECTS_BASE}/${projectId}/canon/${entryId}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload)
+    })
+  }
+
+  static async deleteCanonEntry(projectId: string, entryId: number): Promise<CanonDeleteResponse> {
+    return request(`${PROJECTS_BASE}/${projectId}/canon/${entryId}`, {
+      method: 'DELETE'
     })
   }
 }

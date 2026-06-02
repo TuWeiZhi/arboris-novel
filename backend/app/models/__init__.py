@@ -53,6 +53,7 @@ from .foreshadowing import (
 
 # 新增：小说宪法模型
 from .constitution import NovelConstitution
+from .canon import CanonEntry
 
 # 新增：势力模型
 from .faction import Faction, FactionRelationship, FactionMember, FactionRelationshipHistory
@@ -102,6 +103,7 @@ __all__ = [
     "ForeshadowingAnalysis",
     # 小说宪法模型
     "NovelConstitution",
+    "CanonEntry",
     # 势力模型
     "Faction",
     "FactionRelationship",

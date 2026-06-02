@@ -184,3 +184,5 @@ vector_store.delete(filter={"chapter": 12})
 
    * 增加 `version` 字段
    * 支持修改回滚
+
+更完整的长篇创作改进拆解见 [长篇小说生产线待改进路线图](./longform_improvement_roadmap.md)，其中包含小说圣经、关键词硬触发、时序事件图谱和周期审计等后续建设项。

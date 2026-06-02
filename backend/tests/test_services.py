@@ -7,6 +7,8 @@ from app.services.chapter_context_assembler import (
     ChapterContextAssembler,
     _check_embedding_compatibility,
 )
+from app.services.canon_service import CanonService
+from app.models.canon import CanonEntry
 from app.models.project_memory import ProjectMemory
 from app.models.memory_layer import CharacterState
 from app.utils.character_state import get_project_raw_state_text
@@ -121,6 +123,125 @@ class TestChapterContextAssembler:
         assert visible_names == ["NewChar"]
         assert "NewChar" not in ctx.forbidden_characters
         assert "OldChar" in ctx.forbidden_characters
+
+    async def test_canon_context_is_injected_into_prompt(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        session.add(CanonEntry(
+            project_id="p-canon",
+            category="rule",
+            title="雾钟",
+            content="雾钟响三次后，城门必须关闭。",
+            keywords=["雾钟"],
+            hard_rule=True,
+            status="active",
+            visibility="pov_safe",
+        ))
+        await session.flush()
+
+        assembler = ChapterContextAssembler(
+            session=session,
+            llm_service=SimpleNamespace(),
+            prompt_service=SimpleNamespace(),
+        )
+
+        async def fake_generate_chapter_mission(**_kwargs):
+            return {"macro_beat": "alarm", "allowed_new_characters": []}
+
+        monkeypatch.setattr(
+            assembler,
+            "_generate_chapter_mission",
+            fake_generate_chapter_mission,
+        )
+
+        config = SimpleNamespace(
+            enable_constitution=False,
+            enable_persona=False,
+            enable_foreshadowing=False,
+            enable_faction=False,
+            enable_memory=False,
+            enable_rag=False,
+            rag_mode="simple",
+            version_count=1,
+        )
+
+        ctx = await assembler.assemble(
+            project_id="p-canon",
+            chapter_number=3,
+            user_id=1,
+            writing_notes="雾钟第一次响起。",
+            outlines_map={},
+            chapters=[],
+            blueprint_dict={"characters": [], "relationships": []},
+            project_schema=SimpleNamespace(),
+            outline_title="城门之前",
+            outline_summary="主角听见雾钟。",
+            config=config,
+            visibility_context={},
+            chapter_mission_inputs={
+                "introduced_characters": [],
+                "all_characters": [],
+            },
+        )
+
+        assert ctx.canon_context is not None
+        assert "雾钟响三次后" in ctx.canon_context
+        assert "小说圣经 / Canon" in ctx.prompt_input
+
+
+class TestCanonService:
+
+    async def test_hard_rule_and_keyword_matches_respect_chapter_window(
+        self,
+        session: AsyncSession,
+    ):
+        session.add_all([
+            CanonEntry(
+                project_id="p-canon-service",
+                category="rule",
+                title="星门限制",
+                content="星门每天只能开启一次。",
+                hard_rule=True,
+                status="active",
+                visibility="pov_safe",
+            ),
+            CanonEntry(
+                project_id="p-canon-service",
+                category="item",
+                title="黑钥",
+                content="黑钥可以打开旧城地下门。",
+                keywords=["黑钥"],
+                status="active",
+                visibility="pov_safe",
+                valid_from_chapter=2,
+                valid_until_chapter=5,
+            ),
+            CanonEntry(
+                project_id="p-canon-service",
+                category="location",
+                title="旧港",
+                content="旧港在第十章后被封锁。",
+                keywords=["旧港"],
+                status="active",
+                visibility="pov_safe",
+                valid_from_chapter=10,
+            ),
+        ])
+        await session.flush()
+
+        service = CanonService(session)
+        context = await service.build_prompt_context(
+            "p-canon-service",
+            chapter_number=3,
+            query_text="主角握住黑钥。",
+        )
+
+        assert context is not None
+        assert "星门每天只能开启一次" in context
+        assert "黑钥可以打开旧城地下门" in context
+        assert "旧港在第十章后被封锁" not in context
 
 
 class TestEmbeddingCompatibility:

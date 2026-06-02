@@ -24,6 +24,7 @@ from ..core.config import settings
 from ..models.foreshadowing import Foreshadowing
 from ..models.memory_layer import CausalChain, CharacterState
 from ..models.project_memory import ProjectMemory
+from .canon_service import CanonService, build_canon_query_text
 from .knowledge_retrieval_service import FilteredContext, KnowledgeRetrievalService
 from .llm_service import LLMService
 from .memory_layer_service import MemoryLayerService
@@ -53,6 +54,7 @@ class AssembledChapterContext:
     structured_memory: Optional[str] = None
     rag_context: Optional[Dict[str, Any]] = None
     knowledge_context: Optional[str] = None
+    canon_context: Optional[str] = None
     rag_stats: Optional[Dict[str, Any]] = None
     prompt_sections: List[Tuple[str, str]] = field(default_factory=list)
     prompt_input: str = ""
@@ -146,6 +148,16 @@ class ChapterContextAssembler:
         ctx.introduced_characters = ctx.visibility_context.get("introduced_characters", [])
         ctx.character_profiles = ctx.visibility_context.get("character_profiles", "")
 
+        ctx.canon_context = await self._get_canon_context(
+            project_id=project_id,
+            chapter_number=chapter_number,
+            outline_title=outline_title,
+            outline_summary=outline_summary,
+            writing_notes=writing_notes,
+            chapter_mission=ctx.chapter_mission,
+            writer_blueprint=ctx.writer_blueprint,
+        )
+
         # 4. Enhanced flow context（宪法/Persona/势力）
         if config.enable_constitution or config.enable_persona or config.enable_foreshadowing or config.enable_faction:
             from .enhanced_writing_flow import EnhancedWritingFlow
@@ -213,6 +225,7 @@ class ChapterContextAssembler:
             project_memory_text=ctx.project_memory_text,
             memory_context=ctx.memory_context,
             structured_memory=ctx.structured_memory,
+            canon_context=ctx.canon_context,
             character_profiles=ctx.character_profiles,
         )
 
@@ -425,6 +438,32 @@ class ChapterContextAssembler:
 
     # ---- 记忆上下文 ----
 
+    async def _get_canon_context(
+        self,
+        *,
+        project_id: str,
+        chapter_number: int,
+        outline_title: str,
+        outline_summary: str,
+        writing_notes: str,
+        chapter_mission: Optional[dict],
+        writer_blueprint: Dict[str, Any],
+    ) -> Optional[str]:
+        query_text = build_canon_query_text(
+            outline_title,
+            outline_summary,
+            writing_notes,
+            chapter_mission,
+            writer_blueprint.get("characters", []),
+            writer_blueprint.get("relationships", []),
+        )
+        canon_service = CanonService(self.session)
+        return await canon_service.build_prompt_context(
+            project_id,
+            chapter_number=chapter_number,
+            query_text=query_text,
+        )
+
     async def _get_memory_context(
         self,
         *,
@@ -636,11 +675,15 @@ class ChapterContextAssembler:
         project_memory_text: Optional[str],
         memory_context: Optional[str],
         structured_memory: Optional[str],
+        canon_context: Optional[str],
         character_profiles: str,
     ) -> List[Tuple[str, str]]:
         sections: List[Tuple[str, str]] = []
 
         sections.append(("蓝图 / 写作上下文", json.dumps(writer_blueprint, ensure_ascii=False, indent=2)))
+
+        if canon_context:
+            sections.append(("## 小说圣经 / Canon", canon_context))
 
         if character_profiles:
             sections.append(("## 角色心理档案", character_profiles))

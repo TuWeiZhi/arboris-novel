@@ -249,12 +249,14 @@ import ChapterOutlineSection from '@/components/novel-detail/ChapterOutlineSecti
 import ChaptersSection from '@/components/novel-detail/ChaptersSection.vue'
 import EmotionCurveSection from '@/components/novel-detail/EmotionCurveSection.vue'
 import ForeshadowingSection from '@/components/novel-detail/ForeshadowingSection.vue'
+import CanonSection from '@/components/novel-detail/CanonSection.vue'
 
 interface Props {
   isAdmin?: boolean
 }
 
-type SectionKey = AllSectionType
+type ResourceSectionType = 'canon'
+type SectionKey = AllSectionType | ResourceSectionType
 
 const props = withDefaults(defineProps<Props>(), {
   isAdmin: false
@@ -267,16 +269,17 @@ const novelStore = useNovelStore()
 const projectId = route.params.id as string
 const isSidebarOpen = ref(typeof window !== 'undefined' ? window.innerWidth >= 1024 : true)
 
-const sections: Array<{ key: SectionKey; label: string; description: string }> = [
+const sections = computed<Array<{ key: SectionKey; label: string; description: string }>>(() => [
   { key: 'overview', label: '项目概览', description: '定位与整体梗概' },
   { key: 'world_setting', label: '世界设定', description: '规则、地点与阵营' },
+  ...(!props.isAdmin ? [{ key: 'canon' as SectionKey, label: '小说圣经', description: '规则、线索与硬约束' }] : []),
   { key: 'characters', label: '主要角色', description: '人物性格与目标' },
   { key: 'relationships', label: '人物关系', description: '角色之间的联系' },
   { key: 'chapter_outline', label: '章节大纲', description: props.isAdmin ? '故事章节规划' : '故事结构规划' },
   { key: 'chapters', label: '章节内容', description: props.isAdmin ? '生成章节与正文' : '生成状态与摘要' },
   { key: 'emotion_curve', label: '情感曲线', description: '追踪章节情感变化' },
   { key: 'foreshadowing', label: '伏笔管理', description: '故事线索与回收' }
-]
+])
 
 const sectionComponents: Record<SectionKey, any> = {
   overview: OverviewSection,
@@ -286,7 +289,8 @@ const sectionComponents: Record<SectionKey, any> = {
   chapter_outline: ChapterOutlineSection,
   chapters: ChaptersSection,
   emotion_curve: EmotionCurveSection,
-  foreshadowing: ForeshadowingSection
+  foreshadowing: ForeshadowingSection,
+  canon: CanonSection
 }
 
 // Section icons as functional components
@@ -300,6 +304,11 @@ const getSectionIcon = (key: SectionKey) => {
     world_setting: () => h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2 }, [
       h('circle', { cx: 12, cy: 12, r: 10 }),
       h('path', { d: 'M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z' })
+    ]),
+    canon: () => h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2 }, [
+      h('path', { d: 'M4 19.5A2.5 2.5 0 016.5 17H20' }),
+      h('path', { d: 'M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z' }),
+      h('path', { d: 'M9 7h6M9 11h6M9 15h3' })
     ]),
     characters: () => h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2 }, [
       h('path', { d: 'M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2' }),
@@ -337,6 +346,7 @@ const sectionData = reactive<Partial<Record<SectionKey, any>>>({})
 const sectionLoading = reactive<Record<SectionKey, boolean>>({
   overview: false,
   world_setting: false,
+  canon: false,
   characters: false,
   relationships: false,
   chapter_outline: false,
@@ -347,6 +357,7 @@ const sectionLoading = reactive<Record<SectionKey, boolean>>({
 const sectionError = reactive<Record<SectionKey, string | null>>({
   overview: null,
   world_setting: null,
+  canon: null,
   characters: null,
   relationships: null,
   chapter_outline: null,
@@ -382,14 +393,14 @@ const formattedTitle = computed(() => {
 })
 
 const componentContainerClass = computed(() => {
-  const fillSections: SectionKey[] = ['chapters']
+  const fillSections: SectionKey[] = ['chapters', 'canon']
   return fillSections.includes(activeSection.value)
     ? 'flex-1 min-h-0 h-full flex flex-col overflow-hidden'
     : 'overflow-y-auto'
 })
 
 const contentCardClass = computed(() => {
-  const fillSections: SectionKey[] = ['chapters']
+  const fillSections: SectionKey[] = ['chapters', 'canon']
   return fillSections.includes(activeSection.value)
     ? 'overflow-hidden'
     : 'overflow-visible'
@@ -415,8 +426,8 @@ const loadSection = async (section: SectionKey, force = false) => {
   if (!projectId) return
   
   // 分析型Section使用独立的API，不需要在这里加载
-  const analysisSections: SectionKey[] = ['emotion_curve', 'foreshadowing']
-  if (analysisSections.includes(section)) {
+  const localSections: SectionKey[] = ['emotion_curve', 'foreshadowing', 'canon']
+  if (localSections.includes(section)) {
     return
   }
   
@@ -486,6 +497,8 @@ const componentProps = computed(() => {
       return { outline: data?.chapter_outline || [], editable }
     case 'chapters':
       return { chapters: data?.chapters || [], isAdmin: props.isAdmin }
+    case 'canon':
+      return { projectId, editable }
     default:
       return {}
   }

@@ -10,6 +10,7 @@ from ...core.dependencies import get_current_user
 from ...db.session import get_session
 from ...models.novel import Chapter
 from ...schemas.user import UserInDB
+from ...services.canon_service import CanonService
 from ...services.constitution_service import ConstitutionService
 from ...services.faction_service import FactionService
 from ...services.llm_service import LLMService
@@ -47,6 +48,25 @@ class ProjectMemoryPayload(BaseModel):
     global_summary: Optional[str] = None
     plot_arcs: Optional[Dict[str, Any]] = None
     story_timeline_summary: Optional[str] = None
+
+
+class CanonEntryPayload(BaseModel):
+    id: Optional[int] = None
+    category: str
+    title: str
+    content: str
+    aliases: Optional[List[str]] = None
+    keywords: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+    relations: Optional[Dict[str, Any]] = None
+    status: Optional[str] = "active"
+    visibility: Optional[str] = "pov_safe"
+    source: Optional[str] = None
+    valid_from_chapter: Optional[int] = None
+    valid_until_chapter: Optional[int] = None
+    last_verified_chapter: Optional[int] = None
+    hard_rule: Optional[bool] = False
+    extra: Optional[Dict[str, Any]] = None
 
 
 class FactionPayload(BaseModel):
@@ -188,6 +208,90 @@ async def put_project_memory(
     await session.commit()
     await session.refresh(memory)
     return {"project_id": project_id, "memory": _model_to_dict(memory)}
+
+
+@router.get("/{project_id}/canon")
+async def get_canon_entries(
+    project_id: str,
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    chapter_number: Optional[int] = None,
+    query: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: UserInDB = Depends(get_current_user),
+) -> Dict[str, Any]:
+    novel_service = NovelService(session)
+    await novel_service.ensure_project_owner(project_id, current_user.id)
+
+    canon_service = CanonService(session)
+    entries = await canon_service.list_entries(
+        project_id,
+        category=category,
+        status=status,
+        chapter_number=chapter_number,
+        query=query,
+    )
+    return {"project_id": project_id, "entries": [_model_to_dict(entry) for entry in entries]}
+
+
+@router.post("/{project_id}/canon")
+async def create_canon_entry(
+    project_id: str,
+    payload: CanonEntryPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: UserInDB = Depends(get_current_user),
+) -> Dict[str, Any]:
+    novel_service = NovelService(session)
+    await novel_service.ensure_project_owner(project_id, current_user.id)
+
+    canon_service = CanonService(session)
+    entry = await canon_service.create_entry(
+        project_id,
+        payload.model_dump(exclude_unset=True, exclude={"id"}),
+    )
+    return {"project_id": project_id, "entry": _model_to_dict(entry)}
+
+
+@router.put("/{project_id}/canon/{entry_id}")
+async def update_canon_entry(
+    project_id: str,
+    entry_id: int,
+    payload: CanonEntryPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: UserInDB = Depends(get_current_user),
+) -> Dict[str, Any]:
+    novel_service = NovelService(session)
+    await novel_service.ensure_project_owner(project_id, current_user.id)
+
+    canon_service = CanonService(session)
+    entry = await canon_service.get_entry(entry_id)
+    if not entry or entry.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Canon entry not found")
+
+    entry = await canon_service.update_entry(
+        entry,
+        payload.model_dump(exclude_unset=True, exclude={"id"}),
+    )
+    return {"project_id": project_id, "entry": _model_to_dict(entry)}
+
+
+@router.delete("/{project_id}/canon/{entry_id}")
+async def delete_canon_entry(
+    project_id: str,
+    entry_id: int,
+    session: AsyncSession = Depends(get_session),
+    current_user: UserInDB = Depends(get_current_user),
+) -> Dict[str, Any]:
+    novel_service = NovelService(session)
+    await novel_service.ensure_project_owner(project_id, current_user.id)
+
+    canon_service = CanonService(session)
+    entry = await canon_service.get_entry(entry_id)
+    if not entry or entry.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Canon entry not found")
+
+    await canon_service.delete_entry(entry)
+    return {"project_id": project_id, "deleted_entry_id": entry_id}
 
 
 @router.get("/{project_id}/characters/state")
