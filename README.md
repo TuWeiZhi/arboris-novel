@@ -1,268 +1,136 @@
-# Arboris-Novel | 面向创作者的写作辅助工具
+# Arboris-Novel
 
-**[English](README-en.md)** | 中文
+Arboris-Novel 是一个面向长篇小说创作者的 Web 写作辅助系统。它不是单纯的“自动续写器”，而是围绕小说项目、世界设定、角色状态、章节蓝图、长程记忆和 AI 评审搭建的创作工作台，帮助作者把灵感整理成可持续推进的作品。
 
-![GitHub stars](https://img.shields.io/github/stars/t59688/arboris-novel?style=social)
-![GitHub forks](https://img.shields.io/github/forks/t59688/arboris-novel?style=social)
-![GitHub issues](https://img.shields.io/github/issues/t59688/arboris-novel)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+当前项目采用前后端分离开发，生产镜像内置前端静态资源、Nginx 和 FastAPI 服务。默认使用 SQLite 即可启动，也可以切换到 MySQL、Redis/Celery 和外部向量/嵌入服务。
 
-如果你想使用命令行+编辑器的方式，可搭配使用 [novel-kit](https://github.com/t59688/novel-kit)。
+## 核心功能
 
-写作时容易卡在「主角叫什么」「故事发生在哪」「下一章写什么」这类问题上。**Arboris** 在需要时帮你理清思路、记录设定、给出可选方向，让想法落成故事。
+### 小说项目管理
 
-**在线体验：** [https://arboris.aozhiai.com](https://arboris.aozhiai.com)
+- 创建、导入、查看和删除小说项目。
+- 维护作品名称、类型、简介、蓝图、大纲、章节和版本。
+- 支持管理员查看所有小说项目，普通用户只管理自己的作品。
 
-<p align="center">
-  <table align="center">
-    <tr>
-      <td align="center"><strong>交流群</strong><br/><img width="220" alt="交流群二维码" src="https://github.com/user-attachments/assets/6d4fe420-f8ae-4fe4-883d-235eb576c83b" /></td>
-      <td align="center"><strong>作者公众号</strong><br/><img width="220" alt="作者公众号" src="https://picui.ogmua.cn/s1/2026/02/24/699d109e4ced2.webp" /></td>
-    </tr>
-  </table>
-</p>
+### 灵感到蓝图
 
----
+- 通过灵感对话把零散设想整理成项目方向。
+- 自动生成或手动编辑小说蓝图。
+- 支持角色、关系、地点、世界观规则、章节大纲等结构化信息。
 
-## 界面预览
+### 写作台
 
-<p align="center">
-  <img width="1471" alt="主界面" src="https://github.com/user-attachments/assets/a52d0214-bc1b-4792-8a2b-267b09e47379" />
-</p>
-<p align="center">
-  <img width="1375" alt="角色管理" src="https://github.com/user-attachments/assets/0673faad-43df-4479-83ae-cffa870199a3" />
-</p>
-<p align="center">
-  <img width="1392" alt="大纲编辑" src="https://github.com/user-attachments/assets/b7a7af24-1689-4341-aa78-26b0d74bdddd" />
-</p>
-<p align="center">
-  <img width="1255" alt="写作界面" src="https://github.com/user-attachments/assets/c831d746-8c1a-4ce8-aa1c-9b852da15c11" />
-</p>
+- 按章节生成正文，支持一次生成多个候选版本。
+- 支持选择版本、编辑章节、快速修改章节和删除章节。
+- 章节生成会结合项目设定、章节目标、上下文记忆、伏笔信息和写作人格。
+- 支持章节定稿流程，定稿后更新项目记忆、角色状态、章节快照和向量索引。
 
----
+### 长篇一致性
 
-## 功能概览
+- 小说宪法：记录核心主题、叙事边界、POV、世界规则等硬约束。
+- 作者人格：维护作品语气、叙述偏好、禁用写法和风格要求。
+- 项目记忆：维护全局摘要、剧情线、时间线和章节快照。
+- 角色状态：跟踪角色位置、能力、关系、知识边界和情绪状态。
+- 设定条目：通过 canon 管理固定事实，降低前后矛盾。
 
-### 设定管理
-角色、地点、派系等设定集中记录，随时查阅，避免写到后期前后矛盾（如角色外貌、世界观规则等）。
+### 伏笔与势力
 
-### 大纲与故事线
-零散的场景和灵感可交给 AI 梳理，生成从开头到结局的主线大纲。
+- 创建、追踪、分析和回收伏笔。
+- 支持伏笔提醒、状态历史、相关伏笔和目标回收章节。
+- 支持派系、成员关系、阵营关系和关系变化历史。
 
-### 写作辅助
-状态不佳时可让 AI 先出草稿再按自己的风格修改；也可自己写开头，让 AI 续写以获取灵感。
+### RAG 与知识检索
 
-### 多版本对比
-支持一次生成多版内容，挑选最符合风格的部分，逐步让模型更贴合你的笔触。
+- 每章定稿后可将章节文本分块、向量化并写入 libSQL 向量库。
+- 生成新章节时检索相关剧情 chunk、章节摘要和项目记忆。
+- 支持 OpenAI-compatible Embeddings，也支持 Ollama 本地嵌入模型。
+- 默认向量库为本地 libSQL 文件，生产环境可切换到远程 libSQL/Turso。
 
----
+### 分析与评审
 
-## 项目初衷
+- 情绪曲线、故事轨迹、节奏建议和伏笔分析。
+- 六维评审与一致性检查，辅助发现逻辑、角色、节奏和文风问题。
+- 分层优化器可针对心理、环境、节奏、对话等维度给出修改建议。
 
-目标是做一个**能记住你的世界、理解角色、随故事推进的写作伙伴**，而不是单纯的自动生成器。因此做了 Arboris 并选择开源，方便更多创作者使用。
+### 账户、配置与后台
 
----
+- 用户注册、登录、JWT 鉴权和管理员账户。
+- 可关闭自助注册，或启用 Linux.do OAuth 登录。
+- 支持邮件验证码配置。
+- 管理员后台可管理用户、提示词、系统配置、更新日志、默认模型与每日请求限制。
+- 用户可配置个人 LLM 参数；系统也可提供默认 LLM 配置。
+
+## 使用流程
+
+1. 管理员首次登录
+
+   部署后使用 `.env` 中的 `ADMIN_DEFAULT_USERNAME` 和 `ADMIN_DEFAULT_PASSWORD` 登录。首次上线请立即修改默认管理员密码。
+
+2. 配置模型
+
+   在 `.env` 或后台系统配置中设置 LLM API Key、Base URL、模型名称、嵌入模型和 SMTP 等参数。OpenAI-compatible 服务可通过 `OPENAI_API_BASE_URL` 接入。
+
+3. 创建小说项目
+
+   进入工作区创建项目，也可以通过导入文本创建。先补充作品简介、世界观、角色、派系、地点和初始大纲。
+
+4. 生成蓝图和章节大纲
+
+   使用灵感对话或蓝图生成能力整理主线、章节目标和关键冲突。章节生成前建议先确认对应章节大纲。
+
+5. 写作与评审
+
+   在写作台生成章节，选择候选版本，手动编辑后定稿。需要时运行六维评审、一致性检查、伏笔分析或分层优化。
+
+6. 长篇推进
+
+   定稿后的章节会沉淀为项目记忆、章节快照和向量检索材料，后续章节会继续引用这些信息，帮助保持上下文连续。
 
 ## 快速开始
 
-### 方式一：Docker 部署
+推荐使用 Docker Compose，默认 SQLite 无需单独安装数据库。
 
 ```bash
-# 1. 复制配置文件
 cp deploy/.env.example .env
 
-# 2. 编辑根目录 .env 中的必填项：
-#    - SECRET_KEY: 随机字符串，用于 JWT 等
-#    - OPENAI_API_KEY: 大模型 API Key
-#    - EMBEDDING_API_KEY: 硅基流动 Embedding API Key
-#    - ADMIN_DEFAULT_PASSWORD: 管理员密码（勿用默认值）
+# 编辑 .env，至少设置：
+# - SECRET_KEY
+# - ADMIN_DEFAULT_PASSWORD
+# - OPENAI_API_KEY / OPENAI_API_BASE_URL / OPENAI_MODEL_NAME
+# - EMBEDDING_API_KEY（使用 RAG/章节定稿向量化时需要）
 
-# 3. 启动（默认 SQLite，无需单独安装数据库）
-docker compose -f deploy/docker-compose.yml up -d --build
-
-# 启动后在浏览器访问 http://localhost:<端口>
+docker compose -f deploy/docker-compose.yml --env-file .env up -d --build
 ```
 
-也可以在配置好根目录 `.env` 后使用脚本部署：
+启动后访问：
 
-```bash
-bash deploy/scripts/deploy_docker.sh
-```
+- 前端：`http://localhost:${APP_PORT}`，默认 `http://localhost:8088`
+- 健康检查：`http://localhost:${APP_PORT}/api/health`
+- 本地后端开发 API 文档：`http://127.0.0.1:8000/docs`
 
-### 方式二：使用 MySQL（Compose 内 MySQL）
+完整部署、开发环境、MySQL、Redis/Celery、日志和配置说明见 [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)。
 
-```bash
-# .env 中设置 DB_PROVIDER=mysql、MYSQL_PASSWORD、MYSQL_ROOT_PASSWORD，然后执行：
-docker compose -f deploy/docker-compose.yml --profile mysql up -d --build
-```
+## 本地开发
 
-### 方式三：使用自有 MySQL
-
-```bash
-# 在 .env 中配置 DB_PROVIDER=mysql 以及外部数据库地址、用户名、密码后执行：
-docker compose -f deploy/docker-compose.yml up -d --build
-```
-
-### 可选：启动异步任务 Worker
-
-情感分析、异步任务执行和 Redis 缓存需要额外启用 `worker` profile：
-
-```bash
-docker compose -f deploy/docker-compose.yml --profile worker up -d --build
-
-# 如果同时使用 Compose 内 MySQL：
-docker compose -f deploy/docker-compose.yml --profile mysql --profile worker up -d --build
-```
-
----
-
-## 环境变量说明
-
-常用配置如下（完整项见 `deploy/.env.example`，运行时请复制到根目录 `.env`）：
-
-| 配置项 | 必填吗 | 说明 |
-|--------|--------|------|
-| `SECRET_KEY` | ✅ | JWT 加密密钥，需自行随机生成并妥善保管 |
-| `OPENAI_API_KEY` | ✅ | 你的 LLM API Key（OpenAI 或兼容的） |
-| `OPENAI_API_BASE_URL` | ❌ | API 地址，默认是 OpenAI 官方的 |
-| `OPENAI_MODEL_NAME` | ❌ | 主要生成模型名称，建议显式填写 |
-| `EMBEDDING_API_KEY` | ✅ | 硅基流动 Embedding API Key；若与主 LLM 同 Key 才可复用 |
-| `EMBEDDING_BASE_URL` | ❌ | 默认 `https://api.siliconflow.cn/v1` |
-| `EMBEDDING_MODEL` | ❌ | 默认 `Qwen/Qwen3-Embedding-8B` |
-| `EMBEDDING_MODEL_VECTOR_SIZE` | ❌ | 默认 `1024`，需与嵌入模型维度一致 |
-| `VECTOR_DB_URL` | ❌ | RAG 向量库地址，默认本地 libSQL 文件 `file:./storage/rag_vectors.db` |
-| `DB_PROVIDER` | ❌ | `sqlite` 或 `mysql`，默认 `sqlite` |
-| `MYSQL_*` | 使用 MySQL 时必填 | MySQL 主机、端口、用户、密码、数据库名 |
-| `ADMIN_DEFAULT_PASSWORD` | ❌ | 管理员初始密码，部署后务必修改 |
-| `ALLOW_USER_REGISTRATION` | ❌ | 是否开放注册，默认 `false` |
-| `SMTP_SERVER` / `SMTP_USERNAME` | 开放注册时必填 | 邮件服务，用于发送验证码 |
-
-> **数据存储：** 默认 SQLite，数据在 Docker 卷中。需映射到宿主机目录时，在 `.env` 中设置 `SQLITE_STORAGE_SOURCE=./storage`。
-
-> **嵌入模型：** 当前默认使用硅基流动 OpenAI-compatible Embeddings API 的 `Qwen/Qwen3-Embedding-8B`，不是 Ollama 本地模型。只有在你明确设置 `EMBEDDING_PROVIDER=ollama` 时才需要部署 Ollama。
-
----
-
-## 中间件与部署选型
-
-当前代码状态下，推荐的部署组合如下：
-
-| 组件 | 默认选型 | 是否必需 | 部署方式 |
-|------|----------|----------|----------|
-| 应用服务 | 单容器内 Nginx + FastAPI/Uvicorn + 前端静态文件 | ✅ | `deploy/Dockerfile` 构建，Compose 中 `app` 服务启动 |
-| 关系数据库 | SQLite | ✅ | 默认使用 Docker volume `sqlite-data`，也可用 `SQLITE_STORAGE_SOURCE=./storage` 映射到宿主机 |
-| MySQL | MySQL 8.0 | 可选 | 内置服务通过 `--profile mysql` 启用；外部 MySQL 只需配置 `MYSQL_HOST` 等变量 |
-| 数据库迁移 | Alembic | ✅ | 应用启动时自动执行；也可运行 `bash deploy/scripts/run_migrations.sh` |
-| 向量数据库 | libSQL 本地文件 | ✅（用于 RAG） | 默认 `file:./storage/rag_vectors.db`，随 `/app/storage` 持久化；也可改为远程 libSQL/Turso 地址 |
-| 嵌入模型 | 硅基流动 `Qwen/Qwen3-Embedding-8B` | ✅（用于 RAG） | 远程 OpenAI-compatible API，配置 `EMBEDDING_API_KEY` 即可 |
-| Redis | Redis 7 Alpine | 可选 | 通过 `--profile worker` 启用，供 Celery broker/result backend 和缓存使用 |
-| Celery Worker | Celery 5 | 可选 | 通过 `--profile worker` 启用，执行异步任务 |
-| SMTP | 任意 SMTP 服务 | 可选 | 开放注册或邮件验证码时配置 |
-
----
-
-## 常见问题
-
-### 基础使用
-
-**Q: 不会用 Docker？**  
-A: 安装 Docker Desktop（Windows/Mac）或 Docker Engine（Linux），按上文命令执行即可。
-
-**Q: API Key 会泄露吗？**  
-A: 不会。密钥仅存在于服务端 `.env`，不向前端或用户暴露。
-
-**Q: 是否支持其他大模型？**  
-A: 支持。只要提供 OpenAI 兼容接口，在 `.env` 中配置 `OPENAI_API_BASE_URL` 即可。
-
-**Q: 修改了代码如何参与？**  
-A: 欢迎提交 PR 或 Issue。
-
-### 生成小说时的常见错误
-
-**Q: 提示"未配置默认 LLM API Key"怎么办？**  
-A: 检查 `.env` 文件中的 `OPENAI_API_KEY` 是否正确配置。如果是个人用户，也可以在个人设置中配置自定义 API Key。
-
-**Q: 生成时提示"今日请求次数已达上限"？**  
-A: 系统管理员可能设置了每日请求限制。解决方案：
-- 等到明天再试
-- 在个人设置中配置自己的 API Key（不受系统配额限制）
-- 管理员调整配额限制（修改 `daily_request_limit` 配置）
-
-**Q: 提示"AI 服务响应超时"或"无法连接到 AI 服务"？**  
-A: 网络或 API 服务问题导致。可以：
-- 检查网络连接是否正常
-- 确认 `OPENAI_API_BASE_URL` 配置是否正确
-- 如果使用自建服务，检查服务是否正常运行
-- 稍后重试
-
-**Q: 提示"AI 响应因长度限制被截断"？**  
-A: 生成的内容超过了模型的输出限制。建议：
-- 使用支持更长输出的模型
-
-**Q: 提示"AI 未返回有效内容"或"AI 服务内部错误"？**  
-A: AI 服务端出现问题。通常是暂时性的，可以：
-- 大多是LLM服务的问题，尤其是逆向的API。
-- 检查 API Key 是否有效且有足够余额
-- 查看后端日志获取详细错误信息
-
-**Q: 提示"蓝图中未找到对应章节纲要"？**  
-A: 在生成章节内容前，需要先在蓝图（大纲）中创建对应章节的纲要。请先完善章节大纲再进行生成。
-
-**Q: 提示"未配置摘要提示词"？**  
-A: 系统缺少必要的 Prompt 配置。管理员需要在后台配置名为 `extraction` 的提示词模板，用于生成章节摘要。
-
-**Q: 提示"AI 返回的内容格式不正确"或 JSON 解析错误？**（较常见）  
-A: AI 返回内容无法解析为有效 JSON。可能原因与处理方式：
-- **原因 1：模型能力不足** - 某些模型难以稳定输出结构化 JSON
-  - 解决：切换到能力更强的模型
-  - 或使用支持 structured output 的模型
-- **原因 2：内容过长** - 某些逆向API可能无法支持长输出。
-
-- **临时处理：** 重试几次，或更换 AI 模型
-
-**Q: 生成的内容质量不理想怎么办？**  
-A: 可以尝试：
-- 完善角色、地点、派系等设定信息
-- 优化章节纲要，提供更详细的指引
-- 使用多版本生成功能，让 AI 生成多个版本后挑选最佳的
-- 调整使用的模型，需要长上下文的
-
----
-
-## 技术栈
-
-- **后端：** Python + FastAPI
-- **数据库：** SQLite（默认）或 MySQL 8.0，Alembic 管理迁移
-- **向量检索：** libSQL 本地文件或远程 libSQL/Turso
-- **前端：** Vue + TailwindCSS
-- **异步任务：** Celery + Redis（可选 profile）
-- **部署：** Docker + Docker Compose profiles
-- **AI：** OpenAI-compatible LLM；默认嵌入为硅基流动 `Qwen/Qwen3-Embedding-8B`
-
----
-
-## 面向开发者
-
-### 环境准备
-
-- Python 3.10+（建议使用虚拟环境）
-- Node.js 18+ 与 npm
-- pip / virtualenv（或你习惯的依赖管理工具）
-- 可选：Docker 与 Docker Compose（用于一键部署与发布）
-
-### 后端本地开发
+### 后端
 
 ```bash
 cd backend
-python3 -m venv .venv
-source .venv/bin/activate  # Windows 使用 .venv\Scripts\activate
+python -m venv .venv
+
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+
+# macOS / Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-默认会监听 `http://127.0.0.1:8000`，你可以通过 `--host`、`--port` 调整，或加上 `--reload` 保持热重载。
+后端启动时会自动执行 Alembic 迁移，并初始化管理员、系统配置和默认提示词。
 
-### 前端本地开发
+### 前端
 
 ```bash
 cd frontend
@@ -270,43 +138,159 @@ npm install
 npm run dev
 ```
 
-开发服务器默认运行在 `http://127.0.0.1:5173`，可通过 `--host` 参数暴露给局域网设备。
+前端开发服务器默认运行在 `http://127.0.0.1:5173`。开发态 `/api` 会由 Vite 代理到 `http://127.0.0.1:8000`。
 
-### 打包与构建
-
-- 前端：`npm run build`，构建产物位于 `frontend/dist/`
-- 后端：确认依赖锁定后，可使用 `pip install -r requirements.txt` 安装到目标环境，或基于 `deploy/Dockerfile` 构建镜像
-- 静态文件托管：生产环境下可用 Nginx 等服务托管 `dist` 目录，并由后端提供 API
-
-### 发布与部署
-
-推荐在根目录下使用 Compose 文件完成一体化部署：
+### 常用命令
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d --build
+# 后端迁移
+cd backend
+python -m alembic upgrade head
+
+# 后端测试
+cd backend
+pytest
+
+# 前端类型检查与构建
+cd frontend
+npm run build
+
+# 前端格式化
+npm run format
 ```
 
-如需推送镜像，可在 `deploy` 目录执行 `docker build -t <registry>/arboris:<tag> .`，测试后再 `docker push` 发布。
+## 技术架构
 
----
+### 前端
 
-## 参与贡献
+- Vue 3
+- TypeScript
+- Vite 7
+- Vue Router
+- Pinia
+- Naive UI
+- Tailwind CSS
+- Chart.js
+- marked
 
-- Star 项目
-- 在 Issues 中反馈 Bug 或建议
-- 提交 PR 贡献代码
-- 通过文首二维码加入交流群
+### 后端
 
----
+- Python 3.11 推荐
+- FastAPI
+- SQLAlchemy 2
+- Alembic
+- Pydantic Settings
+- OpenAI Python SDK
+- libSQL client
+- LangChain text splitters
+- Celery + Redis（可选）
+- MySQL asyncmy 或 SQLite aiosqlite
 
-## 反馈与致谢
+### 部署
 
-使用 Arboris 写出作品后，欢迎与我们分享。祝写作顺利。
+- Docker multi-stage build
+- Node 20 构建前端
+- Python 3.11 运行后端
+- Nginx 托管前端并代理 `/api`
+- Supervisor 管理 Nginx 与 Uvicorn
+- Docker Compose profiles 管理可选 MySQL、Redis 和 Celery Worker
 
----
+## 项目结构
 
-## License
+```text
+.
+├── backend/                 # FastAPI 后端
+│   ├── app/
+│   │   ├── api/routers/     # REST API 路由
+│   │   ├── core/            # 配置、依赖和安全
+│   │   ├── db/              # 数据库会话、初始化和默认配置
+│   │   ├── models/          # SQLAlchemy ORM 模型
+│   │   ├── repositories/    # 数据访问层
+│   │   ├── schemas/         # Pydantic 请求/响应模型
+│   │   └── services/        # 写作、记忆、评审、RAG 等业务服务
+│   ├── alembic/             # 数据库迁移
+│   └── prompts/             # 默认提示词模板
+├── frontend/                # Vue 前端
+│   └── src/
+│       ├── api/             # API 客户端
+│       ├── components/      # 页面组件与写作台组件
+│       ├── router/          # 路由
+│       ├── stores/          # Pinia 状态
+│       └── views/           # 页面视图
+├── deploy/                  # Docker、Nginx、Supervisor 和部署脚本
+├── docs/                    # 设计补充材料
+├── README.md                # 项目说明
+└── DEPLOYMENT_GUIDE.md      # 部署说明
+```
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+## 主要 API 模块
 
-[![Star History Chart](https://api.star-history.com/svg?repos=t59688/arboris-novel&type=Date)](https://star-history.com/#t59688/arboris-novel&Date)
+- `/api/auth`：注册、登录、当前用户、登录选项、Linux.do OAuth。
+- `/api/novels`：小说项目、导入、章节、灵感对话、蓝图生成与保存。
+- `/api/writer`：章节生成、多版本选择、评审、章节编辑、定稿。
+- `/api/projects`：小说宪法、作者人格、项目记忆、canon、角色状态、派系和向量重建。
+- `/api/analytics`：情绪曲线、伏笔分析、增强分析和故事轨迹。
+- `/api/optimizer`：分层优化建议与应用。
+- `/api/review`：六维评审和一致性检查。
+- `/api/admin`：用户、项目、提示词、系统配置、更新日志和请求限制。
+- `/api/llm-config`：用户级 LLM 配置和模型探测。
+- `/api/updates`：更新日志查询。
+- `/api/health`：健康检查。
+
+## 配置概览
+
+常用配置位于根目录 `.env`，示例见 `deploy/.env.example`。
+
+| 配置项 | 说明 |
+| --- | --- |
+| `APP_PORT` | Docker 部署时暴露的 HTTP 端口 |
+| `SECRET_KEY` | JWT 加密密钥，生产环境必须使用随机长字符串 |
+| `DB_PROVIDER` | `sqlite` 或 `mysql` |
+| `SQLITE_STORAGE_SOURCE` | SQLite 持久化位置，默认 Docker volume |
+| `MYSQL_*` | MySQL 连接参数，使用 MySQL 时配置 |
+| `OPENAI_API_KEY` | 默认 LLM API Key |
+| `OPENAI_API_BASE_URL` | OpenAI-compatible API Base URL |
+| `OPENAI_MODEL_NAME` | 默认生成模型 |
+| `WRITER_CHAPTER_VERSION_COUNT` | 每次章节生成的候选版本数量 |
+| `EMBEDDING_PROVIDER` | `openai` 或 `ollama` |
+| `EMBEDDING_*` | RAG 嵌入模型配置 |
+| `VECTOR_DB_URL` | libSQL 向量库地址 |
+| `ALLOW_USER_REGISTRATION` | 是否允许自助注册 |
+| `ENABLE_LINUXDO_LOGIN` | 是否启用 Linux.do 登录 |
+| `SMTP_*` | 邮件验证码相关配置 |
+
+## 常见问题
+
+### 提示未配置 LLM API Key
+
+检查 `.env` 中的 `OPENAI_API_KEY`，或在后台系统配置/个人设置中配置可用的 OpenAI-compatible API Key。
+
+### 生成质量不稳定
+
+优先补全项目设定、章节大纲、人物关系和小说宪法；再调整模型、Base URL、章节候选版本数量和提示词模板。
+
+### JSON 解析失败
+
+部分模型不擅长稳定输出结构化 JSON。可以重试、换模型、缩短输入，或使用结构化输出能力更好的模型。
+
+### RAG 或章节定稿失败
+
+检查 `EMBEDDING_PROVIDER`、`EMBEDDING_API_KEY`、`EMBEDDING_MODEL_VECTOR_SIZE` 和 `VECTOR_DB_URL`。更换嵌入模型时，向量维度必须与 `EMBEDDING_MODEL_VECTOR_SIZE` 一致。
+
+### 今日请求次数已达上限
+
+管理员可能设置了每日请求限制。可以等待额度刷新、配置个人 API Key，或由管理员调整后台限制。
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request。提交前建议先运行：
+
+```bash
+cd backend
+pytest
+
+cd ../frontend
+npm run build
+```
+
+如只修改文档，可至少确认 Markdown 链接和命令路径仍然准确。
