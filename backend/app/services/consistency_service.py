@@ -25,6 +25,7 @@ from ..models.project_memory import ProjectMemory
 from ..models.novel import NovelBlueprint, Chapter
 from ..models.foreshadowing import Foreshadowing
 from .llm_service import LLMService
+from .realism_service import resolve_realism_config, render_realism_section
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ CONSISTENCY_CHECK_PROMPT = """\
 - 已埋伏笔是否被正确引用
 - 伏笔回收是否合理
 
+{realism_section}
+
 ## 输入信息
 
 ### 小说设定：
@@ -108,7 +111,7 @@ CONSISTENCY_CHECK_PROMPT = """\
   "violations": [
     {{
       "severity": "critical/major/minor",
-      "category": "setting/character/plot/foreshadowing",
+      "category": "setting/character/plot/foreshadowing/realism",
       "description": "冲突描述",
       "location": "冲突位置（引用原文）",
       "suggested_fix": "修复建议",
@@ -166,7 +169,8 @@ class ConsistencyService:
         project_id: str,
         chapter_text: str,
         user_id: int,
-        include_foreshadowing: bool = True
+        include_foreshadowing: bool = True,
+        chapter_number: Optional[int] = None,
     ) -> ConsistencyCheckResult:
         """
         检查章节一致性
@@ -176,6 +180,7 @@ class ConsistencyService:
             chapter_text: 章节内容
             user_id: 用户ID
             include_foreshadowing: 是否检查伏笔一致性
+            chapter_number: 章节号（用于解析章级现实约束与元素级规则有效性，可空）
             
         Returns:
             ConsistencyCheckResult
@@ -188,13 +193,18 @@ class ConsistencyService:
         # 获取检查所需的上下文
         context = await self._get_check_context(project_id, include_foreshadowing)
         
+        # 解析现实常识审核配置（未启用时渲染为空串，不影响原行为）
+        realism_config = await resolve_realism_config(self.session, project_id, chapter_number)
+        realism_section = render_realism_section(realism_config)
+        
         # 构建检查提示词
         prompt = CONSISTENCY_CHECK_PROMPT.format(
             novel_setting=context.get("novel_setting", "（未设定）"),
             character_state=context.get("character_state", "（未记录）"),
             global_summary=context.get("global_summary", "（无前文摘要）"),
             plot_arcs=context.get("plot_arcs", "（无剧情线记录）"),
-            chapter_text=chapter_text
+            chapter_text=chapter_text,
+            realism_section=realism_section,
         )
         
         try:
@@ -278,7 +288,8 @@ class ConsistencyService:
         project_id: str,
         chapter_text: str,
         user_id: int,
-        auto_fix_threshold: ViolationSeverity = ViolationSeverity.CRITICAL
+        auto_fix_threshold: ViolationSeverity = ViolationSeverity.CRITICAL,
+        chapter_number: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         检查并自动修复一致性问题
@@ -288,6 +299,7 @@ class ConsistencyService:
             chapter_text: 章节内容
             user_id: 用户ID
             auto_fix_threshold: 自动修复的严重程度阈值
+            chapter_number: 章节号（用于现实常识审核）
             
         Returns:
             包含检查结果和修复内容的字典
@@ -296,7 +308,8 @@ class ConsistencyService:
         check_result = await self.check_consistency(
             project_id=project_id,
             chapter_text=chapter_text,
-            user_id=user_id
+            user_id=user_id,
+            chapter_number=chapter_number,
         )
         
         result = {
@@ -459,6 +472,7 @@ class ConsistencyService:
                 "setting": 0,
                 "character": 0,
                 "plot": 0,
-                "foreshadowing": 0
+                "foreshadowing": 0,
+                "realism": 0
             }
         }

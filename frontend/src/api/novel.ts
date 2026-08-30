@@ -384,6 +384,13 @@ export class NovelAPI {
     })
   }
 
+  static async generateCharacterDNA(projectId: string, characterName: string): Promise<NovelProject> {
+    return request(`${NOVELS_BASE}/${projectId}/characters/dna/generate`, {
+      method: 'POST',
+      body: JSON.stringify({ character_name: characterName })
+    })
+  }
+
   static async editChapterContent(
     projectId: string,
     chapterNumber: number,

@@ -36,8 +36,8 @@
         </div>
       </div>
 
-      <!-- DNA档案展开按钮 -->
-      <div class="mt-4 border-t border-gray-200 pt-3">
+      <!-- DNA档案展开按钮 + AI 生成 -->
+      <div class="mt-4 border-t border-gray-200 pt-3 flex items-center justify-between">
         <button 
           @click="toggleDNA(index)" 
           class="flex items-center gap-2 text-sm font-medium text-purple-600 hover:text-purple-800 transition-colors"
@@ -54,6 +54,14 @@
           </svg>
           <span>🧬 角色DNA档案</span>
           <span class="text-xs text-gray-400">(让角色更立体)</span>
+        </button>
+        <button
+          v-if="props.projectId"
+          @click="generateDNA(index)"
+          :disabled="!!generatingDNA[index]"
+          class="text-xs px-2 py-1 rounded-md bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          {{ generatingDNA[index] ? '生成中...' : '✨ AI 生成' }}
         </button>
       </div>
 
@@ -219,6 +227,8 @@
 
 <script setup lang="ts">
 import { ref, watch, reactive, nextTick } from 'vue';
+import { NovelAPI } from '@/api/novel';
+import { globalAlert } from '@/composables/useAlert';
 
 interface DNAProfile {
   childhood_trauma: string;
@@ -248,6 +258,10 @@ const props = defineProps({
   modelValue: {
     type: Array as () => Character[],
     default: () => []
+  },
+  projectId: {
+    type: String,
+    default: ''
   }
 });
 
@@ -255,6 +269,7 @@ const emit = defineEmits(['update:modelValue']);
 
 const localCharacters = ref<Character[]>([]);
 const expandedDNA = reactive<Record<number, boolean>>({});
+const generatingDNA = reactive<Record<number, boolean>>({});
 let syncing = false;
 
 // 初始化DNA档案
@@ -299,6 +314,39 @@ const getDNACompleteness = (character: Character): number => {
 // 切换DNA展开状态
 const toggleDNA = (index: number) => {
   expandedDNA[index] = !expandedDNA[index];
+};
+
+// 调用后端生成角色 DNA 档案
+const generateDNA = async (index: number) => {
+  const character = localCharacters.value[index];
+  if (!character || !character.name.trim()) {
+    globalAlert.showError('请先填写角色姓名');
+    return;
+  }
+  if (!props.projectId) return;
+
+  generatingDNA[index] = true;
+  try {
+    const updatedProject = await NovelAPI.generateCharacterDNA(props.projectId, character.name);
+    const returnedChar = (updatedProject.blueprint?.characters || []).find(
+      (item: any) => item.name === character.name
+    ) as any;
+    const dna = returnedChar?.extra?.dna_profile;
+    if (dna) {
+      character.extra = character.extra || {};
+      character.extra.dna_profile = dna;
+      expandedDNA[index] = true;
+      emit('update:modelValue', JSON.parse(JSON.stringify(localCharacters.value)));
+      globalAlert.showSuccess(`角色「${character.name}」的 DNA 档案生成完成`);
+    } else {
+      globalAlert.showError('生成完成，但未返回有效 DNA 档案');
+    }
+  } catch (error) {
+    console.error('生成角色 DNA 失败:', error);
+    globalAlert.showError(`生成角色 DNA 失败：${error instanceof Error ? error.message : '未知错误'}`);
+  } finally {
+    generatingDNA[index] = false;
+  }
 };
 
 watch(() => props.modelValue, (newVal) => {

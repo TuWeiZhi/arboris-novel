@@ -8,7 +8,12 @@ from app.services.chapter_context_assembler import (
     _check_embedding_compatibility,
 )
 from app.services.canon_service import CanonService
+from app.services.realism_service import resolve_realism_config, render_realism_section
+from app.services.novel_service import NovelService
 from app.models.canon import CanonEntry
+from app.models.constitution import NovelConstitution
+from app.models.chapter_blueprint import ChapterBlueprint
+from app.models.novel import BlueprintCharacter
 from app.models.project_memory import ProjectMemory
 from app.models.memory_layer import CharacterState
 from app.utils.character_state import get_project_raw_state_text
@@ -278,3 +283,109 @@ class TestEmbeddingCompatibility:
         assert llm_service.dimension_model == "nomic-embed-text:latest"
         assert vector_store.called_with == ("nomic-embed-text:latest", 768)
         assert result["compatible"] is True
+
+
+class TestRealismService:
+
+    async def test_no_constitution_disabled(self, session: AsyncSession):
+        config = await resolve_realism_config(session, "p-none")
+        assert config.enabled is False
+        assert render_realism_section(config) == ""
+
+    async def test_global_realistic_enabled_without_element_rules(self, session: AsyncSession):
+        session.add(NovelConstitution(project_id="p-real", realism_level="写实"))
+        await session.flush()
+
+        config = await resolve_realism_config(session, "p-real")
+        assert config.enabled is True
+        assert config.effective_strength == "critical"
+        assert "未配置自定义现实规则" in config.element_rules_text
+        assert "现实常识一致性" in render_realism_section(config)
+
+    async def test_element_rules_filtered_by_chapter_and_exempt_domain(self, session: AsyncSession):
+        session.add(NovelConstitution(project_id="p-elem", realism_level="写实"))
+        session.add(CanonEntry(
+            project_id="p-elem",
+            category="physics",
+            title="人靠嘴吃饭",
+            content="进食必须通过口腔。",
+            hard_rule=True,
+        ))
+        session.add(CanonEntry(
+            project_id="p-elem",
+            category="biology",
+            title="光合作用",
+            content="特殊种族可光合作用。",
+            hard_rule=True,
+            valid_from_chapter=5,
+        ))
+        session.add(ChapterBlueprint(
+            project_id="p-elem",
+            chapter_number=1,
+            mission_constraints={"realism_exempt_domains": ["biology"]},
+        ))
+        await session.flush()
+
+        config = await resolve_realism_config(session, "p-elem", chapter_number=1)
+        categories = [entry.category for entry in config.element_rules]
+        # biology 被本章豁免；即便不豁免，也因 valid_from_chapter=5 在第1章不生效
+        assert "physics" in categories
+        assert "biology" not in categories
+        assert "physics" in config.element_rules_text
+
+    async def test_chapter_override_off_disables_even_with_global(self, session: AsyncSession):
+        session.add(NovelConstitution(project_id="p-off", realism_level="写实"))
+        session.add(ChapterBlueprint(
+            project_id="p-off",
+            chapter_number=2,
+            mission_constraints={"realism_override": "off"},
+        ))
+        await session.flush()
+
+        config = await resolve_realism_config(session, "p-off", chapter_number=2)
+        assert config.enabled is False
+        assert render_realism_section(config) == ""
+
+    async def test_moderate_level_renders_major(self, session: AsyncSession):
+        session.add(NovelConstitution(project_id="p-mixed", realism_level="半写实"))
+        await session.flush()
+
+        config = await resolve_realism_config(session, "p-mixed")
+        assert config.enabled is True
+        assert config.effective_strength == "major"
+        assert "major" in render_realism_section(config)
+
+
+class TestCharacterDNA:
+
+    async def test_get_character_not_found(self, session: AsyncSession):
+        service = NovelService(session)
+        assert await service.get_character("p-none", "不存在") is None
+
+    async def test_set_character_dna_preserves_extra(self, shared_engine):
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+        factory = async_sessionmaker(shared_engine, expire_on_commit=False)
+        async with factory() as s:
+            s.add(BlueprintCharacter(
+                project_id="p-dna",
+                name="李明",
+                identity="程序员",
+                personality="内向",
+                extra={"alias": "明哥"},
+            ))
+            await s.flush()
+
+            service = NovelService(s)
+            character = await service.set_character_dna(
+                "p-dna",
+                "李明",
+                {"core_fear": "害怕失败", "inner_desire": "渴望被认可"},
+            )
+            assert character is not None
+            assert character.extra["alias"] == "明哥"  # 保留原有 extra 列中的键
+            assert character.extra["extra"]["dna_profile"]["core_fear"] == "害怕失败"
+            await s.rollback()  # 隔离清理，避免污染共享引擎
+
+    async def test_set_character_dna_not_found_returns_none(self, session: AsyncSession):
+        service = NovelService(session)
+        assert await service.set_character_dna("p-none", "不存在", {"a": "b"}) is None

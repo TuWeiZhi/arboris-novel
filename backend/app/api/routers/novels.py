@@ -4,6 +4,7 @@ import logging
 from typing import Dict, List
 
 from fastapi import APIRouter, Body, Depends, HTTPException, UploadFile, status
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.dependencies import get_current_user
@@ -53,6 +54,29 @@ def _ensure_prompt(prompt: str | None, name: str) -> str:
     if not prompt:
         raise HTTPException(status_code=500, detail=f"未配置名为 {name} 的提示词，请联系管理员")
     return prompt
+
+
+class GenerateCharacterDNARequest(BaseModel):
+    character_name: str
+
+
+def _format_character_info(character) -> str:
+    """把角色基础信息格式化为 DNA 生成的输入。"""
+    parts = [f"角色姓名：{character.name}"]
+    if character.identity:
+        parts.append(f"身份：{character.identity}")
+    if character.personality:
+        parts.append(f"性格：{character.personality}")
+    if character.goals:
+        parts.append(f"目标：{character.goals}")
+    if character.abilities:
+        parts.append(f"能力：{character.abilities}")
+    if character.relationship_to_protagonist:
+        parts.append(f"与主角关系：{character.relationship_to_protagonist}")
+    existing = (character.extra or {}).get("dna_profile")
+    if existing:
+        parts.append(f"已有DNA档案（请在其基础上补全/优化，保留未提及但仍有价值的字段）：{json.dumps(existing, ensure_ascii=False)}")
+    return "\n".join(parts)
 
 
 @router.post("", response_model=NovelProjectSchema, status_code=status.HTTP_201_CREATED)
@@ -338,4 +362,65 @@ async def patch_blueprint(
     update_data = payload.model_dump(exclude_unset=True)
     await novel_service.patch_blueprint(project_id, update_data)
     logger.info("项目 %s 局部更新蓝图字段：%s", project_id, list(update_data.keys()))
+    return await novel_service.get_project_schema(project_id, current_user.id)
+
+
+@router.post("/{project_id}/characters/dna/generate", response_model=NovelProjectSchema)
+async def generate_character_dna(
+    project_id: str,
+    request: GenerateCharacterDNARequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: UserInDB = Depends(get_current_user),
+) -> NovelProjectSchema:
+    """基于角色基础信息，用 character_dna_guide 提示词生成 8 维 DNA 档案并写回 extra.dna_profile。"""
+    novel_service = NovelService(session)
+    prompt_service = PromptService(session)
+    llm_service = LLMService(session)
+
+    await novel_service.ensure_project_owner(project_id, current_user.id)
+
+    character = await novel_service.get_character(project_id, request.character_name)
+    if not character:
+        raise HTTPException(status_code=404, detail="角色不存在")
+
+    guide_prompt = _ensure_prompt(
+        await prompt_service.get_prompt("character_dna_guide"), "character_dna_guide"
+    )
+
+    user_content = (
+        "请直接生成该角色的完整 DNA 档案（跳过逐维问答），8 个维度全部填充，只输出 JSON。\n\n"
+        + _format_character_info(character)
+    )
+
+    llm_response = await llm_service.get_llm_response(
+        system_prompt=guide_prompt,
+        conversation_history=[{"role": "user", "content": user_content}],
+        temperature=0.7,
+        user_id=current_user.id,
+        timeout=180.0,
+    )
+    llm_response = remove_think_tags(llm_response)
+
+    try:
+        normalized = unwrap_markdown_json(llm_response)
+        sanitized = sanitize_json_like_text(normalized)
+        parsed = json.loads(sanitized)
+    except json.JSONDecodeError as exc:
+        logger.exception(
+            "Failed to parse character DNA response: project_id=%s user_id=%s error=%s",
+            project_id,
+            current_user.id,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"角色 DNA 生成失败，AI 返回的内容格式不正确。错误详情: {str(exc)}",
+        ) from exc
+
+    dna_profile = parsed.get("dna_profile") if isinstance(parsed.get("dna_profile"), dict) else parsed
+    if not isinstance(dna_profile, dict):
+        raise HTTPException(status_code=500, detail="角色 DNA 生成失败，未返回有效的 DNA 档案")
+
+    await novel_service.set_character_dna(project_id, request.character_name, dna_profile)
+    logger.info("项目 %s 角色 %s 的 DNA 档案生成完成", project_id, request.character_name)
     return await novel_service.get_project_schema(project_id, current_user.id)

@@ -167,6 +167,7 @@
       :title="modalTitle"
       :content="modalContent"
       :field="modalField"
+      :project-id="projectId"
       @close="isModalOpen = false"
       @save="handleSave"
     />

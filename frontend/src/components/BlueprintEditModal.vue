@@ -32,7 +32,7 @@
           <div class="md-dialog-content flex-1 overflow-y-auto py-4">
             <ChapterOutlineEditor v-if="props.field === 'chapter_outline'" v-model="editableContent" />
             <KeyLocationsEditor v-else-if="props.field === 'world_setting.key_locations'" v-model="editableContent" />
-            <CharactersEditor v-else-if="props.field === 'characters'" v-model="editableContent" />
+            <CharactersEditor v-else-if="props.field === 'characters'" v-model="editableContent" :project-id="props.projectId" />
             <RelationshipsEditor v-else-if="props.field === 'relationships'" v-model="editableContent" />
             <FactionsEditor v-else-if="props.field === 'world_setting.factions'" v-model="editableContent" />
             <div v-else class="md-text-field">
@@ -85,7 +85,11 @@ const props = defineProps({
     type: [String, Object, Array],
     default: ''
   },
-  field: String
+  field: String,
+  projectId: {
+    type: String,
+    default: ''
+  }
 });
 
 const emit = defineEmits(['close', 'save']);

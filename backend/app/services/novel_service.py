@@ -376,6 +376,43 @@ class NovelService:
         await self.session.commit()
         await self._touch_project(project_id)
 
+    async def get_character(
+        self,
+        project_id: str,
+        character_name: str,
+    ) -> Optional[BlueprintCharacter]:
+        """按名称获取角色（角色卡）。"""
+        stmt = select(BlueprintCharacter).where(
+            BlueprintCharacter.project_id == project_id,
+            BlueprintCharacter.name == character_name,
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+
+    async def set_character_dna(
+        self,
+        project_id: str,
+        character_name: str,
+        dna_profile: Dict,
+    ) -> Optional[BlueprintCharacter]:
+        """把 AI 生成的 DNA 档案写回角色，供前端按 extra.dna_profile 读取。
+
+        前端角色编辑器的约定是「非基础字段放进 extra 列、并以 "extra" 键再包一层」
+        （与 patch_blueprint 的往返一致），因此这里同步写入 extra["extra"]["dna_profile"]，
+        保留 extra 列中其它键不变。
+        """
+        character = await self.get_character(project_id, character_name)
+        if not character:
+            return None
+        stored = dict(character.extra or {})
+        frontend_extra = dict(stored.get("extra") or {})
+        frontend_extra["dna_profile"] = dna_profile
+        stored["extra"] = frontend_extra
+        character.extra = stored
+        await self.session.commit()
+        await self.session.refresh(character)
+        return character
+
     # ------------------------------------------------------------------
     # 章节与版本
     # ------------------------------------------------------------------

@@ -232,7 +232,10 @@ class PipelineOrchestrator:
 
             if config.enable_consistency:
                 best_content, consistency_report = await self._run_consistency_check(
-                    project_id=project_id, chapter_text=best_content, user_id=user_id,
+                    project_id=project_id,
+                    chapter_text=best_content,
+                    user_id=user_id,
+                    chapter_number=chapter_number,
                 )
                 review_summaries["consistency"] = consistency_report
 
@@ -693,9 +696,12 @@ class PipelineOrchestrator:
         project_id: str,
         chapter_text: str,
         user_id: int,
+        chapter_number: Optional[int] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         service = ConsistencyService(self.session, self.llm_service)
-        result = await service.check_consistency(project_id, chapter_text, user_id, include_foreshadowing=True)
+        result = await service.check_consistency(
+            project_id, chapter_text, user_id, include_foreshadowing=True, chapter_number=chapter_number
+        )
         report = {
             "is_consistent": result.is_consistent,
             "summary": result.summary,

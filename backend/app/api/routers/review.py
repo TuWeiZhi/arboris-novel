@@ -34,6 +34,7 @@ class ConsistencyReviewRequest(BaseModel):
     project_id: str
     chapter_text: str
     include_foreshadowing: bool = True
+    chapter_number: Optional[int] = None
 
 
 @router.post("/six-dimension")
@@ -81,6 +82,7 @@ async def review_consistency(
         chapter_text=request.chapter_text,
         user_id=current_user.id,
         include_foreshadowing=request.include_foreshadowing,
+        chapter_number=request.chapter_number,
     )
 
     report = {
