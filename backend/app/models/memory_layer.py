@@ -78,6 +78,10 @@ class CharacterState(Base):
     
     # 元数据
     extra = Column(JSON)
+    confirmed = Column(Boolean, default=True)  # 作者是否已确认（AI 生成默认待确认）
+    locked = Column(Boolean, default=False)  # 锁定后 AI 不得改写
+    source = Column(String(32), default="manual")  # manual / ai
+    evidence = Column(JSON)  # [{chapter_number, quote}]
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

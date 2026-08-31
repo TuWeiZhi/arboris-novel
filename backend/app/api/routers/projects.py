@@ -66,6 +66,8 @@ class CanonEntryPayload(BaseModel):
     valid_until_chapter: Optional[int] = None
     last_verified_chapter: Optional[int] = None
     hard_rule: Optional[bool] = False
+    locked: Optional[bool] = False
+    evidence: Optional[List[Dict[str, Any]]] = None
     extra: Optional[Dict[str, Any]] = None
 
 

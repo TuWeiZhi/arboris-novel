@@ -432,6 +432,10 @@ class FinalizeService:
             return
         extra["raw_state_text"] = state_text
         extra["raw_state_chapter"] = chapter_number
+        # 治理标记：AI 自动生成的角色状态默认“待确认”，作者确认后才成为权威
+        extra["raw_state_source"] = "ai"
+        extra["raw_state_confirmed"] = False
+        extra["raw_state_evidence"] = [{"chapter_number": chapter_number}]
         memory.extra = extra
         flag_modified(memory, "extra")
     

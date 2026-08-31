@@ -144,6 +144,8 @@ class CanonService:
             "valid_until_chapter",
             "last_verified_chapter",
             "hard_rule",
+            "locked",
+            "evidence",
             "extra",
         }
         for key, value in data.items():

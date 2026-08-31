@@ -43,6 +43,8 @@ class CanonEntry(Base):
     valid_until_chapter: Mapped[Optional[int]] = mapped_column(Integer)
     last_verified_chapter: Mapped[Optional[int]] = mapped_column(Integer)
     hard_rule: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    evidence: Mapped[Optional[list]] = mapped_column(JSON)
 
     extra: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
